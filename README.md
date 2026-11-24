@@ -10,7 +10,7 @@
 如果你刚加入项目，建议按这个顺序理解：
 
 1. **这个项目解决什么问题？**  
-   给一段视频或音频，自动识别原文、判断说话人、翻译成目标语言、标注情绪和动作，再调用 GPT-SoVITS 生成多角色配音，最后和原视频/BGM 混音导出。
+   给一段视频或音频，自动分离四轨（对白/歌声/音乐/音效）、联合识别原文与说话人、经剧本分析与口语润色翻译成目标语言、标注情绪和动作，再按需选择 **GPT-SoVITS（支持角色微调）** 或 **CosyVoice 3（零样本）** 生成多角色配音，最后用 FFmpeg 混音并烧录字幕导出成片。
 
 2. **项目的核心文件是什么？**  
    是 `workspace/{project_id}/script.json`。  
@@ -18,8 +18,8 @@
    - 解析结果写进去；
    - 前端时间轴读它；
    - 用户改台词也改它；
-   - GPT-SoVITS 根据它合成音频；
-   - 成片导出也根据它拼轨。
+   - GPT-SoVITS / CosyVoice 3 根据它合成音频；
+   - 成片导出也根据它拼轨并生成字幕。
 
 3. **如果想先看界面效果，最少需要什么？**  
    只需要：
@@ -27,8 +27,8 @@
    - Python 3.10+
    - FFmpeg
 
-   可以只启动后端 + 前端，加载内置 demo 看 UI。  
-   如果要真正跑解析和配音，还要额外配置独立的 `env_parse`（Banquet + MOSS）和 GPT-SoVITS。
+   可以只启动后端 + 前端浏览工程与编辑界面。  
+   如果要真正跑解析和配音，还要额外配置独立的 `env_parse`（Banquet + MOSS）、以及 GPT-SoVITS 或 CosyVoice 3 环境。
 
 4. **不同电脑不用完全照抄开发机路径**  
    本 README 中的 `F:\Download\StageTTS`、`C:\Project\GPT-SoVITS...` 只是当前开发机示例。将 `ENV_PARSE_PYTHON` 指向本机独立 MOSS 环境，并修改 `MOSS_MODEL_PATH`、Banquet、GPT-SoVITS 和缓存路径即可。
@@ -48,15 +48,15 @@ Stage1 Banquet 分离对白、歌声、伴奏和音效
   ↓
 Stage2 MOSS-Transcribe-Diarize 联合 ASR + 匿名说话人 + 句段时间
   ↓
-Stage3 对齐候选、证据保留、人工校对（MOSS 不提供词级强制对齐）
+Stage3 对齐候选、证据保留、人工或一键校对（MOSS 不提供词级强制对齐）
   ↓
-Stage4 LLM 翻译 / 情绪 / 动作 / 是否保留原声
+Stage4 LLM 三步配音翻译（全片分析 → 可选联网专名校对 → 初译与口语润色）
   ↓
 script.json
   ↓
-GPT-SoVITS 按句合成配音
+GPT-SoVITS（端口 9880）或 CosyVoice 3 零样本（端口 9881）按句合成配音
   ↓
-FFmpeg 混音导出 output.mp4
+FFmpeg 混音与可选 ASS 硬字幕烧录导出 output.mp4
 ```
 
 MOSS 主模型固定至本地已审核 revision `10304d926740cf5a5cee05a268086e3265197910`，通过独立 `env_parse` 子进程运行；Banquet 分离、MOSS 联合转录与 GPT-SoVITS 合成串行接力显存。
@@ -76,10 +76,12 @@ MOSS 输出的是模型联合生成的**句段时间**与窗口内匿名角色�
 | MOSS 联合 ASR 与 diarization | 主解析路径 | Banquet → MOSS → LLM。已完成 MOSS 10 / 30 / 60 秒英日真实推理及独立短样例全流程接入。当前输入上限为 90 分钟，实测覆盖至 60 秒；90 分钟是上游模型声明，不是本应用验证或承诺。MOSS 仅输出句段时间，词级对齐和准确率仍需审核。|
 | WhisperX + pyannote | 仅历史 / 显式回滚 | 不是默认或静默 fallback；缺少 MOSS 配置或推理失败时明确报错。|
 | `script.json` 数据契约 | 已完成 | Pydantic v2 与 TypeScript 类型 1:1 对齐 |
-| GPT-SoVITS 分组配音 | 已完成 | 按角色切换权重、按情绪选择参考音，缺失时使用与原文对应的同角色原声片段 |
-| 8GB 显存串行接力 | 已完成 | 解析前释放 GPT-SoVITS，配音时按需拉起 |
-| 配音时长闭环 | 已完成 | 全部配音、全管线和智能体统一支持双向质检：>1.15x 自动精简，<0.8x 自动自然补足；最多两轮，最后才用 0.85–1.15x 温和变速兜底，试听与导出使用同一份调速后的音频 |
-| 参考音与角色校对 | 已完成 | 在「角色与情绪音色」中编辑/合并角色、批量改派、上传或试听 3–10 秒参考音并保存逐字稿；自动参考音从通过校对、无说话人重叠的同角色原句中挑选，不再从任意时间点盲截；在「精修」中校对原文与说话人，在「项目媒体素材 → 翻译设置」中编辑术语表 |
+| 三步自然翻译与联网校对 | 已完成 | Pass 0 全片设定与术语抽取 → 可选 Pass 0.5 免费联网专名校对（Wikipedia + DuckDuckGo）→ Pass 1 初译 → Pass 2 配音口语润色，ComfyUI 节点卡内可直接开关 |
+| 双 TTS 引擎切换 | 已完成 | 支持 **GPT-SoVITS**（端口 `9880`，支持 `v2 / v2Pro / v2ProPlus` 角色微调训练与音色预设库）与 **CosyVoice 3 零样本**（端口 `9881`，8GB 显卡 fp16 低显存加载，自动同语种 `zero_shot` / 跨语种 `cross_lingual`）并在设置页一键切换 |
+| 8GB 显存串行接力 | 已完成 | 解析前释放正在运行的 TTS 服务，配音时按所选引擎按需拉起 |
+| 配音时长闭环与导出贴合 | 已完成 | 双向时长反思改写（>1.15x 精简 / <0.8x 补足）+ `0.85–1.15x` 温和调速；`/render` 导出默认开启 `auto_fit_overflow` 对轻微侵入下一句的片段自动温和 `atempo` 贴合（最高 `1.35x`） |
+| 字幕烧录与工作区交互 | 已完成 | 支持 Premiere 风格时间轴拖拽平移/边缘拉伸、角色面板与时间轴一键确认待校对、ComfyUI 节点参数内嵌及 FFmpeg 单次烧录 ASS 硬字幕（`无 / 原文（识别） / 译文 / 双语`） |
+| 参考音与角色校对 | 已完成 | 在左侧「角色面板」编辑/合并角色、一键微调、上传或试听参考音与预设；自动参考音从通过校对、无说话人重叠的同角色原句中挑选 |
 | 评测脚本 | 骨架就绪 | 需要接入真实评测集后才能真正跑出指标 |
 
 ---
@@ -144,15 +146,14 @@ MOSS 输出的是模型联合生成的**句段时间**与窗口内匿名角色�
 
 ### 3.2 Stage4 翻译怎么生成？
 
-Stage4 使用**全文源对白上下文 + 每批最多 25 条输出**，不是只调用一次 LLM：
+Stage4 使用**全片分析 + 全文上下文分批初译 + 口语化润色**（每批最多 25 条输出）：
 
-1. 后端把当前项目所有非空原句按时间顺序拼成完整源对白，每批请求都携带；
-2. 每句保留原始 `id`、说话人、角色说话风格、术语表和软字数预算；
-3. LLM 通读对白，为当前批次的 `id` 返回译文、情绪、动作和原声事件建议；
-4. 后端严格校验当前批次的 ID、重复和缺失项，保留合法部分，错误显式返回；
-5. 疑似漏译时单独修复译文，保留既有情绪、动作与已有原声保留标记。普通英文词被翻成中文不再被视为漏词。已有保留标记尚无人工/模型来源字段，可能包含旧模型误判，需要人工复核；M0不自动清除存量布尔值。
+1. **Pass 0 全片设定分析**（开启「口语润色」或「联网校对」时）：通读完整源对白，归纳题材基调、角色说话风格（非破坏式补全空 `speaking_style`）与核心术语；
+2. **Pass 0.5 联网专名校对**（在 ComfyUI「翻译与情绪」节点勾选「联网校对」时）：仅对最多 8 个不确定专名/IP 译名执行免 Key 检索（Wikipedia + DuckDuckGo），校对固定译法但不覆盖人工术语；
+3. **Pass 1 忠实初译**：携带完整源对白、`show_bible`、声学线索和软字数预算逐条输出译文、情绪、动作及原声事件建议，缺失/疑漏触发单句修复；
+4. **Pass 2 配音口语润色**（开启「口语润色」时）：按角色口吻、气口断句去翻译腔改写，并通过术语/数字/缩写保真校验，未通过则回退 Pass 1 初译。
 
-全文上下文帮助保持前后承接和术语一致性，语义完整性仍需校验与试听。正常短应答（Yes、Go、你好、はい等）必须翻译，不能仅因短或 LLM 返回布尔值就保留外语原声；自动保留仅允许明确非语言事件记号。
+正常短应答（Yes、Go、你好、はい等）必须翻译，不能仅因短或 LLM 返回布尔值就保留外语原声；自动保留仅允许明确非语言事件记号。
 
 ### 3.3 它给 GPT-SoVITS 提供什么？
 
@@ -209,7 +210,8 @@ Stage4 使用**全文源对白上下文 + 每批最多 25 条输出**，不是�
 | FFmpeg | 抽音频、探测时长、最终混音 | 必须 | 6.x+，开发机为 9.1 |
 | Node.js | 前端 Vite 项目 | 必须 | Node.js 20 LTS |
 | Python backend | 跑 FastAPI 后端 | 必须 | Python 3.10+ |
-| GPT-SoVITS | 生成配音 | 完整流程必须 | RTX 50 系列请用 CUDA 12.8 适配版 |
+| GPT-SoVITS | 生成配音（支持微调） | 至少配置一种 TTS 引擎 | RTX 50 系列请用 CUDA 12.8 适配版 |
+| CosyVoice 3 | 零样本配音（端口 `9881`） | 可选，与 GPT-SoVITS 二选一 | 独立 Python 3.10 + `Fun-CosyVoice3-0.5B-2512`，8GB 显卡 fp16 约 2.0 GB 显存 |
 | env_parse | Banquet 四轨分离 + MOSS 联合识别/说话人/句段时间 | 完整解析必须 | 独立 Python 3.12 + torch / torchaudio 2.8.0+cu128 + Transformers 5.6.0 |
 | Hugging Face Token | 当前本地 MOSS 主解析 | 不需要 | pinned 本地 snapshot；推理时不下载 |
 | WhisperX / pyannote | 明确选择 legacy 时的历史路径 | 默认不需要 | 不参与 MOSS 主依赖或自动回退 |
@@ -227,8 +229,8 @@ Stage4 使用**全文源对白上下文 + 每批最多 25 条输出**，不是�
 - Python 3.10+
 - FFmpeg
 
-不需要配置 GPT-SoVITS 和 env_parse。  
-只能使用内置 demo 看 UI 和基础交互，不能真正解析长视频和生成高质量配音。
+不需要配置 GPT-SoVITS、CosyVoice 3 和 env_parse。  
+只能打开已有项目或查看 UI 和基础交互，不能真正解析视频和生成配音。
 
 ---
 
@@ -448,11 +450,9 @@ LLM_MODEL=workbuddy-ai/hy4flash-free
 
 The UI settings page persists model, endpoint and key in the ignored local backend settings file; keep secrets out of tracked documentation. Do not put access tokens in this example.
 
-#### 在 UI 中设置 GPT-SoVITS 微调方案
+#### 在 UI 中选择配音引擎与 GPT-SoVITS 微调方案
 
-顶部“设置”中的“GPT-SoVITS 模型与微调”提供 v2、v2Pro、v2ProPlus 底模以及独立的 GPT / SoVITS epoch（1–100 整数）。默认方案为 v2Pro、GPT 15 轮、SoVITS 10 轮；界面显示本地权重缺失情况和默认推理配置版本。方案保存至忽略跟踪的 `backend/training_settings.local.json`，不会切换当前推理权重、启动训练或表示这些轮数已经训练完成。
-
-训练入口和长视频训练集处理尚未接入。取得素材后需先按角色整理干净音频、校对逐字稿、划分训练与验证素材，再根据此方案生成实际训练配置。epoch 的合适值取决于训练数据和验证试听，不能只按轮数判断效果。
+顶部“设置”支持切换默认配音引擎（**GPT-SoVITS** 或 **CosyVoice 3（零样本）**，保存至忽略跟踪的 `backend/tts_settings.local.json`，切换时会自动停止已运行的旧引擎释放显存）；在 `GPT-SoVITS` 下展开折叠选项即可选择 `v2` / `v2Pro` / `v2ProPlus` 底模和 GPT/SoVITS 训练轮数（保存至 `backend/training_settings.local.json`），并在左侧「角色面板」直接发起单角色微调训练与音色预设管理。
 
 #### 在 UI 中切换翻译模型
 
@@ -468,9 +468,9 @@ The UI settings page persists model, endpoint and key in the ignored local backe
 
 ---
 
-### 5.4 配置 GPT-SoVITS（env_tts）
+### 5.4 配置配音引擎 env_tts（GPT-SoVITS 与可选 CosyVoice 3）
 
-#### 推荐方式
+#### 选项 A：GPT-SoVITS（默认，支持角色微调）
 
 使用适配 RTX 50 系列 / CUDA 12.8 的 GPT-SoVITS 整合包。  
 开发机路径示例：
@@ -479,14 +479,7 @@ The UI settings page persists model, endpoint and key in the ignored local backe
 C:\Project\GPT-SoVITS-v5-20261006nvidia50x0
 ```
 
-确认它能找到：
-
-```text
-runtime\python.exe
-api_v2.py
-```
-
-然后在 `backend/.env` 中配置：
+确认它能找到 `runtime\python.exe` 和 `api_v2.py`，并在 `backend/.env` 中配置：
 
 ```env
 GPT_SOVITS_ROOT=C:/Project/GPT-SoVITS-v5-20261006nvidia50x0
@@ -494,7 +487,20 @@ GPT_SOVITS_CONFIG=backend/tts_v2.yaml
 TTS_AUTO_MANAGE=1
 ```
 
-开启 `TTS_AUTO_MANAGE=1` 后，后端会在需要配音时自动拉起 GPT-SoVITS。
+#### 选项 B：CosyVoice 3（零样本，端口 `9881`）
+
+适合免训练直接零样本克隆。在独立 Python 3.10 + CUDA 12.8 环境部署 `Fun-CosyVoice3-0.5B-2512`，并在 `backend/.env` 中配置：
+
+```env
+COSYVOICE3_ROOT=F:/Download/StageTTS/CosyVoice
+COSYVOICE3_PYTHON=F:/Download/StageTTS/env_cosyvoice3/Scripts/python.exe
+COSYVOICE3_MODEL_DIR=F:/Download/StageTTS/cosyvoice_models/Fun-CosyVoice3-0.5B-2512
+COSYVOICE3_API_URL=http://127.0.0.1:9881
+```
+
+由 `workers/cosyvoice3_server.py` 托管启动，采用 `float16` 初始化与流式显存加载（RTX 5060 8GB 实测占用约 2.0 GB 显存），并在跨语种（如日文参考音 → 中文台词）时自动切换 `inference_cross_lingual` 消除外语口音。
+
+开启 `TTS_AUTO_MANAGE=1` 后，后端会根据当前所选引擎按需自动拉起对应 TTS 服务。
 
 #### 如果要手动启动 GPT-SoVITS
 
@@ -609,24 +615,17 @@ http://127.0.0.1:5173/
 
 1. 打开 `http://127.0.0.1:5173/`
 2. 如果右上角显示“后端已连接”，说明前后端连通。
-3. 可以点“载入演示样例”先看内置界面。
-4. 如果要处理自己的视频：
-   - 点“新建 / 导入音视频”；
-   - 选择 MP4 / WAV；
-   - 等待创建项目。
-5. 切到顶部“节点流”：
-1. 在画布选中「媒体输入 / 音轨分离」开始 Banquet + MOSS 完整解析；只想从已有对白开始时选择翻译节点。MOSS 默认限制 60 秒，超时/超预算前会明确失败，不自动切分或静默回退。
-   - 已有对白时，选中“翻译与情绪标注”节点和目标语言，点“翻译并保存剧本”，即可跳过音轨分离和识别；
-   - 运行按钮会直接读取选中的节点，并从该节点继续到合成与导出；选中“剧本枢纽”或“语音合成与反思”使用现有译文，选中“视频混音导出”使用现有配音；
-   - “语音识别与聚类”暂不支持单独启动，请选“音轨分离”执行完整解析；“虚拟舞台演播”通过右侧“进入虚拟舞台”打开。未选中可运行节点时运行按钮不可用；
-   - 运行前会保存当前台词、术语表和角色设置。部分翻译失败时保留成功译文，并停止后续合成/导出；
-   - 右侧“运行日志”显示实际执行步骤，跳过的节点保持待机；
-   - 运行时可点“暂停”：当前后端步骤完成并保存后暂停，点击“继续”接着运行；等待期间可取消暂停，也可“结束流程”保留已有结果并停止后续步骤。解析（含分离/识别/翻译）、独立翻译、批量合成、导出各自是一个步骤，无法在请求内部即时暂停；最后一步完成后流程直接结束。暂停状态仅在当前页面中保留，刷新后可选中相应节点从已保存结果继续。
-6. 解析完成后切回“剪辑”：
-   - 检查时间轴、台词、说话人；
-   - 单句可点“重合成试听”；
-   - 全部片段可点右上角“全部配音”。
-7. 满意后点“导出成片”。
+3. 导入音视频或打开最近项目：
+   - 点“导入媒体”或将 MP4 / WAV 拖入启动框创建项目；
+   - 或从右侧“最近项目”列表直接打开。
+4. 切到顶部“节点流”：
+   - 画布中各节点卡片直接内嵌了核心参数（如「翻译与情绪」内的目标/原声语言、**口语润色**、**联网校对**开关；「混音导出」内的伴奏音量、**字幕烧录（无 / 原文（识别） / 译文 / 双语）**、闪避与水印）；
+   - 在画布选中「媒体输入 / 音轨分离」开始 Banquet + MOSS 完整解析；已有对白时可选中「翻译与情绪」节点仅执行翻译；选中「剧本枢纽 / 语音合成 / 混音导出」可从对应断点继续；
+   - 右侧“运行日志”显示实际执行步骤，跳过的节点保持待机；支持“暂停 / 继续 / 结束流程”。
+5. 切回“剪辑”微调与配音：
+   - 时间轴支持**拖动块体整体平移片段**、拖拽左右边缘微调入/出点，可在时间轴工具栏点「全部确认」或左侧角色面板点「一键确认本角色」批量消除待校对状态；
+   - 单句可点“重配”，全部未就绪片段可点时间轴右上“合成待处理”。
+6. 满意后在「导出」弹窗或「混音导出」节点导出成片（支持烧录识别原文/译文/双语 ASS 硬字幕与同名外挂 `.ass`）。
 
 ---
 
@@ -704,10 +703,12 @@ StageTTS/
 │   ├── schemas.py                      # script.json 数据契约
 │   ├── tts_v2.yaml                     # 8GB 显卡轻量 GPT-SoVITS 配置
 │   ├── .env.example                    # 环境变量模板
-│   ├── agent/                          # Agent 工具与 Prompt
-│   └── services/                       # TTS、混音、GPU 调度
+│   ├── agent/                          # 导演/润色 Prompt 与编排工具
+│   └── services/                       # TTS 路由/设置、三步翻译、联网检索、微调、混音、字幕、GPU 调度
 ├── workers/
-│   └── parse_worker.py                 # 解析流水线
+│   ├── parse_worker.py                 # Banquet + MOSS 解析流水线
+│   ├── banquet_worker.py               # 四轨分离 worker
+│   └── cosyvoice3_server.py            # CosyVoice 3 低显存零样本推理服务
 ├── frontend/
 │   └── src/
 │       ├── components/                 # UI 组件

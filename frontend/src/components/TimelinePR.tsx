@@ -50,6 +50,7 @@ export const TimelinePR: React.FC = () => {
   const mergeSegmentWithNext = useProjectStore((s) => s.mergeSegmentWithNext);
   const addSegment = useProjectStore((s) => s.addSegment);
   const deleteSegment = useProjectStore((s) => s.deleteSegment);
+  const confirmAllPendingReviews = useProjectStore((s) => s.confirmAllPendingReviews);
 
   const waveContainerRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -59,8 +60,9 @@ export const TimelinePR: React.FC = () => {
   const [segmentFilter, setSegmentFilter] = useState<TimelineFilter>("all");
   const [dragInfo, setDragInfo] = useState<{
     segmentId: number;
-    edge: "start" | "end";
+    edge: "start" | "end" | "move";
     time: number;
+    endTime?: number;
     duration: number;
   } | null>(null);
 
@@ -201,13 +203,23 @@ export const TimelinePR: React.FC = () => {
   const pendingCount = script.segments.filter(
     (seg) => !seg.keep_original && seg.status !== "ready",
   ).length;
+  const pendingReviewCount = script.segments.filter(
+    (seg) =>
+      seg.segment_timing_needs_review !== false ||
+      seg.alignment_needs_review !== false ||
+      (seg.speaker_needs_review !== false && seg.speaker !== "UNKNOWN"),
+  ).length;
   const sortedSegments = [...script.segments].sort((a, b) => a.start - b.start || a.id - b.id);
   const selectedSegment = script.segments.find((seg) => seg.id === selectedSegmentId) ?? null;
 
   const matchesFilter = (seg: (typeof script.segments)[number]) => {
     if (segmentFilter === "all") return true;
     if (segmentFilter === "review") {
-      return Boolean(seg.alignment_needs_review || seg.speaker_needs_review);
+      return (
+        seg.segment_timing_needs_review !== false ||
+        seg.alignment_needs_review !== false ||
+        seg.speaker_needs_review !== false
+      );
     }
     if (segmentFilter === "pending") {
       return !seg.keep_original && seg.status !== "ready";
@@ -219,6 +231,27 @@ export const TimelinePR: React.FC = () => {
     const rect = e.currentTarget.getBoundingClientRect();
     const offsetX = Math.max(0, e.clientX - rect.left);
     setCurrentTime(offsetX / timelineZoom);
+  };
+
+  const snapToTimelineTargets = (
+    raw: number,
+    minAllowed: number,
+    maxAllowed: number,
+    snapTargets: number[],
+  ): number => {
+    const quantized = Math.round(raw / 0.05) * 0.05;
+    const clamped = Math.max(minAllowed, Math.min(maxAllowed, quantized));
+    let best = clamped;
+    let bestDist = 0.08;
+    for (const target of snapTargets) {
+      if (target < minAllowed || target > maxAllowed) continue;
+      const dist = Math.abs(target - clamped);
+      if (dist <= bestDist) {
+        bestDist = dist;
+        best = target;
+      }
+    }
+    return Number(best.toFixed(2));
   };
 
   const beginEdgeResize = (
@@ -248,23 +281,6 @@ export const TimelinePR: React.FC = () => {
         ? Math.max(minAllowed, seg.end - minDuration)
         : Math.max(seg.start + minDuration, seg.end, nextStart);
 
-    const snapTime = (raw: number): number => {
-      const quantized = Math.round(raw / 0.05) * 0.05;
-      const clamped = Math.max(minAllowed, Math.min(maxAllowed, quantized));
-      const snapTargets = [currentTime, Math.round(clamped), prevEnd, nextStart];
-      let best = clamped;
-      let bestDist = 0.08;
-      for (const target of snapTargets) {
-        if (target < minAllowed || target > maxAllowed) continue;
-        const dist = Math.abs(target - clamped);
-        if (dist <= bestDist) {
-          bestDist = dist;
-          best = target;
-        }
-      }
-      return Number(best.toFixed(2));
-    };
-
     selectSegment(seg.id);
     let committed = false;
     setDragInfo({
@@ -276,7 +292,13 @@ export const TimelinePR: React.FC = () => {
 
     const onPointerMove = (moveEvent: PointerEvent) => {
       const dx = moveEvent.clientX - originX;
-      const snapped = snapTime(initialEdgeTime + dx / timelineZoom);
+      const rawTime = initialEdgeTime + dx / timelineZoom;
+      const snapped = snapToTimelineTargets(rawTime, minAllowed, maxAllowed, [
+        currentTime,
+        Math.round(rawTime),
+        prevEnd,
+        nextStart,
+      ]);
       if (!committed && snapped !== Number(initialEdgeTime.toFixed(2))) {
         commitHistoryCheckpoint();
         committed = true;
@@ -323,6 +345,79 @@ export const TimelinePR: React.FC = () => {
     window.addEventListener("pointercancel", onPointerUp);
   };
 
+  const beginClipMove = (
+    e: React.PointerEvent<HTMLDivElement>,
+    seg: (typeof script.segments)[number],
+  ) => {
+    if (editsDisabled || e.button !== 0) {
+      return;
+    }
+    activeDragCleanupRef.current?.();
+    const idx = sortedSegments.findIndex((item) => item.id === seg.id);
+    const prevEnd = idx > 0 ? sortedSegments[idx - 1].end : 0;
+    const nextStartBound =
+      idx >= 0 && idx < sortedSegments.length - 1 ? sortedSegments[idx + 1].start : duration + 30;
+    const clipDuration = Number(Math.max(0.2, seg.end - seg.start).toFixed(2));
+    const rawMaxStart = nextStartBound - clipDuration;
+    const minStart = Math.max(0, Math.min(seg.start, prevEnd));
+    const maxStart = Math.max(minStart, seg.start, rawMaxStart);
+    const originX = e.clientX;
+    let committed = false;
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const dx = moveEvent.clientX - originX;
+      if (!committed && Math.abs(dx) < 4) {
+        return;
+      }
+      const rawStart = seg.start + dx / timelineZoom;
+      const nextStart = snapToTimelineTargets(rawStart, minStart, maxStart, [
+        currentTime,
+        Math.round(rawStart),
+        prevEnd,
+        rawMaxStart,
+      ]);
+      const nextEnd = Number((nextStart + clipDuration).toFixed(2));
+      if (!committed) {
+        selectSegment(seg.id);
+        commitHistoryCheckpoint();
+        committed = true;
+      }
+      setDragInfo({
+        segmentId: seg.id,
+        edge: "move",
+        time: nextStart,
+        endTime: nextEnd,
+        duration: clipDuration,
+      });
+      updateSegmentLocal({ id: seg.id, start: nextStart, end: nextEnd }, { skipHistory: true });
+    };
+
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+      if (activeDragCleanupRef.current === cleanup) {
+        activeDragCleanupRef.current = null;
+      }
+      setDragInfo(null);
+    };
+
+    const onPointerUp = () => {
+      if (committed) {
+        justDraggedRef.current = true;
+        window.setTimeout(() => {
+          justDraggedRef.current = false;
+        }, 0);
+      }
+      cleanup();
+    };
+
+    activeDragCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+  };
+
   return (
     <div className="flex h-full select-none flex-col bg-[#222222] text-[12px]">
       {/* 紧凑工具条（右侧留足 pr-4，避免 + 按钮贴边裁切） */}
@@ -335,8 +430,11 @@ export const TimelinePR: React.FC = () => {
           </span>
           {dragInfo && (
             <span className="shrink-0 rounded-[3px] bg-[#181818] px-1.5 py-0.5 font-mono tabular-nums text-[10px] text-primary">
-              #{dragInfo.segmentId} {dragInfo.edge === "start" ? "入点" : "出点"}{" "}
-              {dragInfo.time.toFixed(2)}s · {dragInfo.duration.toFixed(2)}s
+              #{dragInfo.segmentId}{" "}
+              {dragInfo.edge === "move"
+                ? `移动 ${dragInfo.time.toFixed(2)}s–${(dragInfo.endTime ?? dragInfo.time).toFixed(2)}s`
+                : `${dragInfo.edge === "start" ? "入点" : "出点"} ${dragInfo.time.toFixed(2)}s`}{" "}
+              · {dragInfo.duration.toFixed(2)}s
             </span>
           )}
         </div>
@@ -365,6 +463,19 @@ export const TimelinePR: React.FC = () => {
               </button>
             ))}
           </div>
+
+          {pendingReviewCount > 0 && (
+            <button
+              type="button"
+              disabled={editsDisabled}
+              onClick={() => confirmAllPendingReviews()}
+              title="一键确认全部待校对片段的边界、对齐与角色"
+              className="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[4px] border border-white/[0.08] bg-[#282828] px-2 py-1 text-[11px] text-primary transition-colors hover:bg-[#343434] disabled:opacity-45"
+            >
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#D4933D]" />
+              <span className="font-mono tabular-nums">全部确认 ({pendingReviewCount})</span>
+            </button>
+          )}
 
           <div className="flex items-center gap-1 rounded-[4px] bg-[#181818] p-0.5">
             <button
@@ -627,7 +738,9 @@ export const TimelinePR: React.FC = () => {
                     key={seg.id}
                     role="button"
                     tabIndex={0}
-                    title={tooltip}
+                    draggable={false}
+                    title={`${tooltip}\n提示：左右拖动块体平移片段，拖动左右边缘调整入/出点`}
+                    onPointerDown={(e) => beginClipMove(e, seg)}
                     onClick={() => {
                       if (justDraggedRef.current) {
                         return;
@@ -648,7 +761,9 @@ export const TimelinePR: React.FC = () => {
                       borderColor: isSelected ? speakerAccent : "transparent",
                       borderLeftColor: speakerAccent,
                     }}
-                    className={`group absolute inset-y-1.5 flex cursor-pointer flex-col justify-between overflow-hidden rounded-[4px] border border-l-[3px] text-left transition-colors ${
+                    className={`group absolute inset-y-1.5 flex touch-none flex-col justify-between overflow-hidden rounded-[4px] border border-l-[3px] text-left transition-colors ${
+                      editsDisabled ? "cursor-default" : "cursor-grab active:cursor-grabbing"
+                    } ${
                       width >= 76 ? "px-2 py-1" : width >= 32 ? "px-1 py-1" : "px-0.5 py-1"
                     } ${
                       isSelected ? "z-10 bg-[#333333]" : "bg-[#2A2A2A] hover:bg-[#303030]"
@@ -657,12 +772,12 @@ export const TimelinePR: React.FC = () => {
                     <div
                       onPointerDown={(e) => beginEdgeResize(e, seg, "start")}
                       title="拖拽调整入点"
-                      className="absolute inset-y-0 left-0 z-20 w-1.5 cursor-ew-resize bg-transparent transition-colors group-hover:bg-white/[0.12]"
+                      className="absolute inset-y-0 left-0 z-20 w-2 cursor-ew-resize bg-transparent transition-colors group-hover:bg-white/[0.12]"
                     />
                     <div
                       onPointerDown={(e) => beginEdgeResize(e, seg, "end")}
                       title="拖拽调整出点"
-                      className="absolute inset-y-0 right-0 z-20 w-1.5 cursor-ew-resize bg-transparent transition-colors group-hover:bg-white/[0.12]"
+                      className="absolute inset-y-0 right-0 z-20 w-2 cursor-ew-resize bg-transparent transition-colors group-hover:bg-white/[0.12]"
                     />
 
                     {width < 32 ? (

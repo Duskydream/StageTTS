@@ -11,7 +11,8 @@ from typing import List, Optional, Tuple
 from pydub import AudioSegment
 
 from backend import config
-from backend.schemas import ProjectScript
+from backend.schemas import ProjectScript, SubtitleBurnMode
+from backend.services.subtitles import write_ass_file
 from backend.services.task_runner import probe_media_duration
 
 
@@ -69,7 +70,11 @@ def _find_watermark_font() -> Optional[str]:
 
 
 def _build_vocal_track(
-    script: ProjectScript, project_dir: Path, *, timeline_duration: float | None = None,
+    script: ProjectScript,
+    project_dir: Path,
+    *,
+    timeline_duration: float | None = None,
+    auto_fit_overflow: bool = False,
 ) -> Path:
     """Mix complete clips, blocking any overflow that cannot use empty timeline space."""
     timeline_duration = script.media.duration if timeline_duration is None else timeline_duration
@@ -131,7 +136,38 @@ def _build_vocal_track(
                     with adjusted_path.open("rb") as source:
                         clip = AudioSegment.from_wav(source)
 
-            clip_end = seg.start + clip.frame_count() / clip.frame_rate
+            clip_dur = clip.frame_count() / clip.frame_rate
+            clip_end = seg.start + clip_dur
+            if auto_fit_overflow:
+                next_starts = [
+                    other.start
+                    for other in script.segments
+                    if other.id != seg.id and other.start > seg.start
+                ]
+                next_start = min(next_starts) if next_starts else None
+                safe_end = timeline_duration
+                if next_start is not None:
+                    guard_end = next_start - 0.03 if next_start - 0.03 > seg.start + 0.1 else next_start
+                    safe_end = min(safe_end, guard_end)
+                collides_next = next_start is not None and clip_end > seg.end and clip_end > next_start
+                needs_fit = clip_end > timeline_duration + 0.000001 or collides_next
+                if needs_fit and clip_end > safe_end and safe_end > seg.start + 0.1:
+                    avail_sec = safe_end - seg.start
+                    needed_speed = (clip_dur / avail_sec) * 1.008
+                    if needed_speed <= 1.35:
+                        fit_src = tmp_dir / f"fit_{seg.id}.wav"
+                        with fit_src.open("wb") as fp:
+                            clip.export(fp, format="wav")
+                        fitted_path = apply_gentle_tempo(fit_src, needed_speed, tmp_dir)
+                        with fitted_path.open("rb") as source:
+                            clip = AudioSegment.from_wav(source)
+                        clip_dur = clip.frame_count() / clip.frame_rate
+                        clip_end = seg.start + clip_dur
+                        if safe_end < clip_end <= safe_end + 0.05:
+                            limit_ms = max(50, int(avail_sec * 1000))
+                            clip = clip[:limit_ms].fade_out(min(15, limit_ms))
+                            clip_end = seg.start + clip.frame_count() / clip.frame_rate
+
             if clip_end > timeline_duration + 0.000001:
                 raise RuntimeError(
                     f"片段 #{seg.id} 导出待审核：完整配音超过媒体结尾 "
@@ -202,9 +238,23 @@ def _build_drawtext_filter() -> str:
     )
 
 
+def _build_ass_subtitle_filter(ass_path: Path) -> str:
+    """Build FFmpeg ass= filter string with Windows drive colons and quotes escaped."""
+    escaped = (
+        str(ass_path.resolve())
+        .replace("\\", "/")
+        .replace(":", r"\:")
+        .replace("'", r"\'")
+    )
+    return f"ass='{escaped}'"
+
+
 def mix_and_render(
     script: ProjectScript,
     burn_watermark: bool = False,
+    burn_subtitles: SubtitleBurnMode = "none",
+    *,
+    auto_fit_overflow: bool = False,
 ) -> Tuple[str, float]:
     """执行 pydub 毫秒拼轨与 FFmpeg 混音封装导出。
 
@@ -229,7 +279,10 @@ def mix_and_render(
                 raise RuntimeError("导出待审核：无法确认源视频时长，不能安全安排配音。")
             timeline_duration = min(timeline_duration, source_duration)
     dubbed_vocals_path = _build_vocal_track(
-        script, project_dir, timeline_duration=timeline_duration,
+        script,
+        project_dir,
+        timeline_duration=timeline_duration,
+        auto_fit_overflow=auto_fit_overflow,
     )
 
     bgm_path: Optional[Path] = None
@@ -290,7 +343,14 @@ def mix_and_render(
         audio_filter = None
         audio_map = ["-map", "0:v:0", "-map", "1:a:0"]
 
-    if not burn_watermark:
+    vf_filters: List[str] = []
+    if burn_subtitles != "none":
+        ass_path = write_ass_file(script, layout=burn_subtitles, dest_path=project_dir / "subtitles.ass")
+        vf_filters.append(_build_ass_subtitle_filter(ass_path))
+    if burn_watermark:
+        vf_filters.append(_build_drawtext_filter())
+
+    if not vf_filters:
         cmd = list(base_inputs)
         if audio_filter:
             cmd.extend(["-filter_complex", audio_filter])
@@ -300,7 +360,7 @@ def mix_and_render(
         if proc.returncode != 0:
             raise RuntimeError(f"FFmpeg 无损封装失败: {proc.stderr[-600:]}")
     else:
-        drawtext = _build_drawtext_filter()
+        vf_chain = ",".join(vf_filters)
         for video_codec_args in (
             ["-c:v", "h264_nvenc", "-preset", "p4"],
             ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"],
@@ -309,14 +369,14 @@ def mix_and_render(
             if audio_filter:
                 cmd.extend(["-filter_complex", audio_filter])
             cmd.extend(audio_map)
-            cmd.extend(["-vf", drawtext])
+            cmd.extend(["-vf", vf_chain])
             cmd.extend(video_codec_args)
             cmd.extend(["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", str(output_mp4)])
             proc = _run_ffmpeg_cmd(cmd)
             if proc.returncode == 0:
                 break
         else:
-            raise RuntimeError(f"FFmpeg 硬水印导出失败: {proc.stderr[-600:]}")
+            raise RuntimeError(f"FFmpeg 画面烧录导出失败: {proc.stderr[-600:]}")
 
     out_duration = probe_media_duration(output_mp4) or script.media.duration
     return f"/workspace/{script.project_id}/output.mp4", out_duration

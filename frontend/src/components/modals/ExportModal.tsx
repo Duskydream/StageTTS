@@ -232,12 +232,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({ open, onClose, onExpor
 
   const burnOptions: Array<{ id: SubtitleBurnMode; label: string }> = [
     { id: "none", label: "不烧录" },
+    { id: "source", label: "识别原文" },
     { id: "target", label: "单语译文" },
     { id: "bilingual", label: "双语对照" },
   ];
 
   const sidecarOptions: Array<{ id: SidecarOption; label: string }> = [
     { id: "none", label: "不导出" },
+    { id: "source", label: "原文 .ass" },
     { id: "target", label: "单语 .ass" },
     { id: "bilingual", label: "双语 .ass" },
   ];
@@ -350,7 +352,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ open, onClose, onExpor
             {!isAudioOnly && (
               <div className="space-y-1">
                 <span className="block text-[11px] text-secondary">烧录 ASS 硬字幕到画面</span>
-                <div className="grid h-7 grid-cols-3 gap-0.5 rounded-[4px] bg-[#181818] p-0.5">
+                <div className="grid h-7 grid-cols-4 gap-0.5 rounded-[4px] bg-[#181818] p-0.5">
                   {burnOptions.map((opt) => {
                     const active = pipelineConfig.burnSubtitles === opt.id;
                     return (
@@ -375,7 +377,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ open, onClose, onExpor
 
             <div className="space-y-1">
               <span className="block text-[11px] text-secondary">同步导出外挂 ASS 字幕文件</span>
-              <div className="grid h-7 grid-cols-3 gap-0.5 rounded-[4px] bg-[#181818] p-0.5">
+              <div className="grid h-7 grid-cols-4 gap-0.5 rounded-[4px] bg-[#181818] p-0.5">
                 {sidecarOptions.map((opt) => {
                   const active = sidecar === opt.id;
                   return (

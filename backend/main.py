@@ -26,6 +26,13 @@ from backend.services.training_settings import (
     InferenceModelUpdate, TrainingSettings, TrainingSettingsResponse,
     apply_inference_base_model, training_settings_response, save_training_settings,
 )
+from backend.services.tts_settings import (
+    TtsSettings,
+    TtsSettingsResponse,
+    read_tts_engine,
+    save_tts_engine,
+    tts_settings_response,
+)
 from backend.services.voice_presets import (
     create_voice_preset, delete_voice_preset, list_voice_presets,
 )
@@ -166,6 +173,13 @@ def _value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": _err_detail(exc)})
 
 
+@app.exception_handler(RuntimeError)
+def _runtime_error_handler(_: Request, exc: RuntimeError) -> JSONResponse:
+    msg = _err_detail(exc)
+    status_code = 400 if "导出待审核" in msg else 500
+    return JSONResponse(status_code=status_code, content={"detail": msg})
+
+
 @app.exception_handler(KeyError)
 def _key_error_handler(_: Request, exc: KeyError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": _err_detail(exc)})
@@ -217,6 +231,16 @@ def put_inference_base_model(req: InferenceModelUpdate) -> TrainingSettingsRespo
     return apply_inference_base_model(req.base_model)
 
 
+@app.get("/api/settings/tts", response_model=TtsSettingsResponse)
+def get_tts_settings() -> TtsSettingsResponse:
+    return tts_settings_response()
+
+
+@app.put("/api/settings/tts", response_model=TtsSettingsResponse)
+def put_tts_settings(req: TtsSettings) -> TtsSettingsResponse:
+    return save_tts_engine(req.engine)
+
+
 @app.get("/api/voice-presets", response_model=VoicePresetListResponse)
 def get_voice_presets() -> VoicePresetListResponse:
     return VoicePresetListResponse(presets=list_voice_presets())
@@ -245,6 +269,9 @@ def update_llm_settings(req: LLMSettingsUpdate) -> LLMSettingsResponse:
 @app.get("/api/health", response_model=HealthResponse)
 def health_check() -> Dict[str, object]:
     """服务健康检查、GPU 单任务锁状态与外部环境就绪度探测。"""
+    active_tts_url = (
+        config.COSYVOICE3_API_URL if read_tts_engine() == "cosyvoice3" else config.TTS_API_URL
+    )
     return {
         "status": "ok",
         "busy": is_gpu_busy(),
@@ -254,7 +281,7 @@ def health_check() -> Dict[str, object]:
             "ffmpeg": check_ffmpeg_available(),
             "tts_service": check_tts_service(),
             "tts_auto_manage": config.TTS_AUTO_MANAGE,
-            "tts_url": config.TTS_API_URL,
+            "tts_url": active_tts_url,
             "llm_configured": config.is_llm_configured(),
             "hf_token_configured": config.is_hf_token_configured(),
             "banquet_configured": config.is_banquet_configured(),
@@ -414,11 +441,29 @@ def retranslate_project(project_id: str, req: TranslationRequest | None = None) 
                 if seg.id in eligible:
                     seg.target_lang = target_lang
         batch_errors: list[str] = []
-        translated = translate_script(candidate, create_openai_client(), errors=batch_errors)
+        natural_polish = bool(req.natural_polish) if req is not None else False
+        web_search = bool(req.web_search) if req is not None else False
+        translated = translate_script(
+            candidate,
+            create_openai_client(),
+            errors=batch_errors,
+            enable_analysis=natural_polish or web_search,
+            enable_polish=natural_polish,
+            enable_web_search=web_search,
+        )
         successful = set(translated) & eligible
         if not successful:
             detail = batch_errors[0] if batch_errors else "LLM 未返回任何合法译文，请检查模型配置后重试"
             raise LLMServiceError(f"台词重译失败：{detail}")
+
+        for spk, candidate_char in candidate.characters.items():
+            if spk in script.characters and not (script.characters[spk].speaking_style or "").strip():
+                if (candidate_char.speaking_style or "").strip():
+                    script.characters[spk].speaking_style = candidate_char.speaking_style.strip()
+        for term, mapped in candidate.glossary.items():
+            if isinstance(term, str) and isinstance(mapped, str) and term.strip() and mapped.strip():
+                if term not in script.glossary:
+                    script.glossary[term] = mapped
 
         candidates = {seg.id: seg for seg in candidate.segments}
         for seg in script.segments:
@@ -554,6 +599,8 @@ def parse_project_media(project_id: str, req: ParseRequest) -> ProjectScript:
             target_lang=req.target_lang,
             source_lang=req.source_lang or (existing_script.source_lang if existing_script else None),
             mode=mode,
+            natural_polish=req.natural_polish,
+            web_search=req.web_search,
         )
         return load_project_script(safe_id)
 
@@ -660,5 +707,10 @@ def render_project_video(project_id: str, req: RenderRequest) -> RenderResponse:
     safe_id = _validate_project_id(project_id)
     return RenderResponse(
         project_id=safe_id,
-        **render_final_video(safe_id, burn_watermark=req.burn_watermark),
+        **render_final_video(
+            safe_id,
+            burn_watermark=req.burn_watermark,
+            burn_subtitles=req.burn_subtitles,
+            auto_fit_overflow=req.auto_fit_overflow,
+        ),
     )

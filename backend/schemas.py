@@ -13,8 +13,8 @@ ProjectMode = Literal["video_dubbing", "virtual_stage"]
 EmotionType = Literal["neutral", "angry", "happy", "sad", "whisper"]
 SegmentStatus = Literal["pending", "synthesizing", "ready", "error"]
 AvatarType = Literal["live2d", "vrm"]
-SubtitleBurnMode = Literal["none", "target", "bilingual"]
-SubtitleLayout = Literal["target", "bilingual"]
+SubtitleBurnMode = Literal["none", "source", "target", "bilingual"]
+SubtitleLayout = Literal["source", "target", "bilingual"]
 
 
 class CinematicStems(BaseModel):
@@ -463,6 +463,8 @@ class ParseRequest(BaseModel):
         default=None, description="User-declared source audio language; never inferred from target language",
     )
     target_lang: str = Field(default="zh", description="目标翻译语种")
+    natural_polish: bool = Field(default=True, description="是否启用全片剧本分析与口语润色")
+    web_search: bool = Field(default=False, description="是否启用联网校对专有名词与译名")
 
 
 class SegmentPatch(BaseModel):
@@ -500,6 +502,8 @@ class TranslationRequest(BaseModel):
         default=None, min_length=1, max_length=32, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$",
         description="Override target language for successfully translated segments only; omit to keep each segment language",
     )
+    natural_polish: bool = Field(default=False, description="是否启用全片剧本分析与口语润色")
+    web_search: bool = Field(default=False, description="是否启用联网校对专有名词与译名")
 
 
 class TranslationResponse(BaseModel):
@@ -588,15 +592,19 @@ class RenderRequest(BaseModel):
     )
     burn_subtitles: SubtitleBurnMode = Field(
         default="none",
-        description="是否将 ASS 字幕烧录进成片画面：none / target / bilingual",
+        description="是否将 ASS 字幕烧录进成片画面：none / source / target / bilingual",
     )
     export_ass_sidecar: Optional[SubtitleLayout] = Field(
         default=None,
-        description="可选：同步导出同名外挂 ASS 字幕（target / bilingual）",
+        description="可选：同步导出同名外挂 ASS 字幕（source / target / bilingual）",
     )
     auto_ducking: Optional[bool] = Field(
         default=None,
         description="是否启用 BGM 自动闪避；为空时沿用 script.media.auto_ducking",
+    )
+    auto_fit_overflow: bool = Field(
+        default=True,
+        description="导出时对轻微侵入下一句或片尾的片段自动温和变速贴合（最高 1.35x）",
     )
     output_filename: Optional[str] = Field(
         default=None,

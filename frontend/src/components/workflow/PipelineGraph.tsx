@@ -2,7 +2,6 @@ import {
   Background,
   BackgroundVariant,
   Controls,
-  MiniMap,
   type NodeTypes,
   ReactFlow,
   ReactFlowProvider,
@@ -133,20 +132,6 @@ const PipelineGraphInner: React.FC = () => {
           color="rgba(255, 255, 255, 0.03)"
         />
         <Controls position="bottom-left" />
-        <MiniMap
-          position="bottom-right"
-          pannable
-          zoomable
-          nodeColor={(node) => {
-            const cat = node.data?.category;
-            if (cat === "input") return "#B08276";
-            if (cat === "parse") return "#9A80A6";
-            if (cat === "hub") return "#B59A64";
-            if (cat === "synthesis") return "#649C91";
-            return "#6D94B6";
-          }}
-          maskColor="rgba(18, 18, 18, 0.72)"
-        />
       </ReactFlow>
     </div>
   );

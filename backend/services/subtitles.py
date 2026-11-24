@@ -110,7 +110,10 @@ def generate_ass_subtitles(
 
     events: list[str] = []
     for seg in sorted(script.segments, key=lambda item: (item.start, item.id)):
-        primary_raw = seg.target_text.strip() or seg.orig_text.strip()
+        if layout == "source":
+            primary_raw = seg.orig_text.strip() or seg.target_text.strip()
+        else:
+            primary_raw = seg.target_text.strip() or seg.orig_text.strip()
         if not primary_raw:
             continue
         escaped_primary = _escape_ass_text(primary_raw)

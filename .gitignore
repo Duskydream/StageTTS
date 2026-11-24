@@ -111,3 +111,6 @@ backend/llm_settings.local.json
 
 # Local fine-tuning recipe
 backend/training_settings.local.json
+
+# Local TTS engine selection
+backend/tts_settings.local.json

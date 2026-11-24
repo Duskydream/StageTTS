@@ -9,14 +9,21 @@ from collections.abc import Callable, Iterable
 from openai import OpenAI, OpenAIError
 
 from backend import config
-from backend.agent.prompts import DIRECTOR_TRANSLATE_PROMPT, TRANSLATION_REPAIR_PROMPT
+from backend.agent.prompts import (
+    DIALOGUE_POLISH_PROMPT,
+    DIRECTOR_TRANSLATE_PROMPT,
+    GLOSSARY_WEB_REFINE_PROMPT,
+    SCRIPT_ANALYSIS_PROMPT,
+    TRANSLATION_REPAIR_PROMPT,
+)
 from backend.schemas import ProjectScript, Segment
+from backend.services import web_search
 
 EMOTIONS = {"neutral", "angry", "happy", "sad", "whisper"}
 CONTEXT_INSTRUCTIONS = (
     "先通读完整对白理解剧情、角色关系和前后语气，再按原句 id 还原译文。"
-    "参照相邻台词、角色语气和术语表；术语出现时使用固定译法。"
-    "忠实优先：不得摘要、概括、省略、删词或改成名词短语；min_units/max_units 只是软预算。"
+    "参照相邻台词、角色语气、show_bible 与术语表；术语出现时使用固定译法。"
+    "语义完整优先：在符合目标语自然口语语序与配音气口的前提下完整传达语义，不得摘要、概括、省略关键事实或改成名词短语；min_units/max_units 只是软预算。"
     "只处理 lines 中的片段 ID。"
 )
 
@@ -59,36 +66,75 @@ def client_model(client: OpenAI) -> str:
     return model if isinstance(model, str) else config.LLM_MODEL
 
 
-def complete_dialogue(client: OpenAI, system: str, payload: dict) -> list[dict]:
+def _extract_json_payload(content: str, *, left_char: str, right_char: str, err_msg: str):
+    fences = re.findall(r"```(json)?\s*([\s\S]*?)```", content, flags=re.IGNORECASE)
+    if fences:
+        content = (
+            next((body.strip() for lang, body in fences if lang and left_char in body and right_char in body), None)
+            or next((body.strip() for _, body in fences if left_char in body and right_char in body), None)
+            or fences[0][1].strip()
+        )
+    left, right = content.find(left_char), content.rfind(right_char)
+    if left == -1 or right <= left:
+        raise ValueError(err_msg)
+    return json.loads(content[left:right + 1])
+
+
+def complete_json_object(
+    client: OpenAI,
+    system: str,
+    payload: dict,
+    *,
+    temperature: float = 0.2,
+) -> dict:
+    response = client.chat.completions.create(
+        model=client_model(client),
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        temperature=temperature,
+    )
+    content = (response.choices[0].message.content or "").strip()
+    parsed = _extract_json_payload(content, left_char="{", right_char="}", err_msg="LLM 未返回 JSON 对象")
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM 未返回 JSON 对象")
+    return parsed
+
+
+def complete_dialogue(
+    client: OpenAI,
+    system: str,
+    payload: dict,
+    *,
+    temperature: float = 0.3,
+) -> list[dict]:
     response = client.chat.completions.create(
         model=client_model(client),
         messages=[
             {"role": "system", "content": system + "\n" + CONTEXT_INSTRUCTIONS},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ],
-        temperature=0.3,
+        temperature=temperature,
     )
     content = (response.choices[0].message.content or "").strip()
-    fences = re.findall(r"```(json)?\s*([\s\S]*?)```", content, flags=re.IGNORECASE)
-    if fences:
-        content = (
-            next((body.strip() for lang, body in fences if lang and "[" in body and "]" in body), None)
-            or next((body.strip() for _, body in fences if "[" in body and "]" in body), None)
-            or fences[0][1].strip()
-        )
-    left, right = content.find("["), content.rfind("]")
-    if left == -1 or right <= left:
-        raise ValueError("LLM 未返回 JSON 数组")
-    entries = json.loads(content[left:right + 1])
+    entries = _extract_json_payload(content, left_char="[", right_char="]", err_msg="LLM 未返回 JSON 数组")
     if not isinstance(entries, list):
         raise ValueError("LLM 未返回 JSON 数组")
     return [entry for entry in entries if isinstance(entry, dict)]
 
 
 class DialogueContext:
-    def __init__(self, script: ProjectScript, *, acoustic_hints: dict[int, dict] | None = None):
+    def __init__(
+        self,
+        script: ProjectScript,
+        *,
+        acoustic_hints: dict[int, dict] | None = None,
+        show_bible: dict | None = None,
+    ):
         self.script = script
         self.acoustic_hints = acoustic_hints or {}
+        self.show_bible = {k: v for k, v in (show_bible or {}).items() if v}
         self.ordered = sorted(script.segments, key=lambda seg: (seg.start, seg.id))
         self.positions = {seg.id: index for index, seg in enumerate(self.ordered)}
 
@@ -141,7 +187,7 @@ class DialogueContext:
 
     def payload(self, entries: Iterable[dict]) -> dict:
         lines = list(entries)
-        return {
+        data = {
             "source_lang": self.script.source_lang,
             "glossary": self.script.glossary,
             "constraints": {
@@ -153,6 +199,9 @@ class DialogueContext:
             "batch_ids": [line.get("id") for line in lines],
             "lines": lines,
         }
+        if self.show_bible:
+            data["show_bible"] = self.show_bible
+        return data
 
     def whole_dialogue_payload(
         self,
@@ -184,6 +233,44 @@ class DialogueContext:
         })
         return payload
 
+    def polish_payload(
+        self,
+        segments: Iterable[Segment],
+        *,
+        full_segments: Iterable[Segment] | None = None,
+    ) -> dict:
+        """构造 Pass 2 口语化润色请求，保留核心语义与术语预算。"""
+        ordered = sorted(segments, key=lambda seg: (seg.start, seg.id))
+        dialogue_source = sorted(full_segments or segments, key=lambda seg: (seg.start, seg.id))
+        lines = []
+        for seg in ordered:
+            item = self.entry(seg)
+            item["draft_text"] = seg.target_text
+            item.pop("target_text", None)
+            lines.append(item)
+        dialogue_lines = []
+        for seg in dialogue_source:
+            character = self.script.characters.get(seg.speaker)
+            speaker_name = character.display_name if character else seg.speaker
+            dialogue_lines.append(f"[{seg.id}] {speaker_name}: {seg.orig_text.strip()}")
+        target_lang = next((seg.target_lang for seg in ordered if seg.target_lang), "zh")
+        data: dict = {
+            "source_lang": self.script.source_lang,
+            "target_lang": target_lang,
+            "glossary": self.script.glossary,
+            "dialogue": "\n".join(dialogue_lines),
+            "batch_ids": [line.get("id") for line in lines],
+            "lines": lines,
+            "output_requirements": (
+                "仅润色 lines 中的片段 ID，保持自然口语与角色人设；"
+                "保留核心事实、数字、否定与 glossary 固定译法；"
+                "只输出 JSON 数组：[{\"id\": int, \"target_text\": str, \"self_check\": {\"semantic_complete\": bool, \"omitted_info\": str}}]。"
+            ),
+        }
+        if self.show_bible:
+            data["show_bible"] = self.show_bible
+        return data
+
 
 def _self_check_flags(entry: dict, *, require: bool = False) -> tuple[bool, str]:
     check = entry.get("self_check")
@@ -196,11 +283,13 @@ def _self_check_flags(entry: dict, *, require: bool = False) -> tuple[bool, str]
 
 
 def _term_in_text(text: str, term: str) -> bool:
-    """Latin terms need word boundaries; CJK terms are checked as substrings."""
+    """Apply alphanumeric boundaries only on alphanumeric edges; CJK edges match directly."""
     if not term:
         return False
     if re.search(r"[A-Za-z0-9]", term):
-        pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
+        prefix = r"(?<![A-Za-z0-9])" if re.match(r"^[A-Za-z0-9]", term) else ""
+        suffix = r"(?![A-Za-z0-9])" if re.search(r"[A-Za-z0-9]$", term) else ""
+        pattern = f"{prefix}{re.escape(term)}{suffix}"
         return re.search(pattern, text, re.IGNORECASE) is not None
     return term in text
 
@@ -350,11 +439,219 @@ def _batch_error(errors: list[str] | None, message: str) -> None:
         errors.append(message)
 
 
+def _merge_glossary_entries(
+    glossary: dict[str, str],
+    additions: object,
+    *,
+    protected_keys: set[str],
+    allow_overwrite_provisional: bool = False,
+) -> int:
+    """Merge discovered glossary terms without clobbering user-supplied entries."""
+    if not isinstance(additions, dict):
+        return 0
+    merged = 0
+    for raw_term, raw_target in additions.items():
+        if not isinstance(raw_term, str) or not isinstance(raw_target, str):
+            continue
+        term, target = raw_term.strip(), raw_target.strip()
+        if not term or not target:
+            continue
+        if term in protected_keys:
+            continue
+        if not allow_overwrite_provisional and term in glossary:
+            continue
+        glossary[term] = target
+        merged += 1
+    return merged
+
+
+def _analyze_script(
+    script: ProjectScript,
+    segments: list[Segment],
+    client: OpenAI,
+    *,
+    target_lang: str,
+    enable_web_search: bool,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    """Run Pass 0 script/character analysis and optional Pass 0.5 web term lookup."""
+    if not segments:
+        return {}
+    user_glossary_keys = {k.strip() for k in script.glossary if isinstance(k, str) and k.strip()}
+    dialogue_lines = []
+    for seg in segments:
+        character = script.characters.get(seg.speaker)
+        speaker_name = character.display_name if character else seg.speaker
+        dialogue_lines.append(f"[{seg.id}] {speaker_name} ({seg.speaker}): {seg.orig_text.strip()}")
+
+    characters_summary = {
+        spk: {
+            "display_name": ch.display_name,
+            "speaking_style": ch.speaking_style,
+        }
+        for spk, ch in script.characters.items()
+    }
+    analysis_payload = {
+        "source_lang": script.source_lang,
+        "target_lang": target_lang,
+        "characters": characters_summary,
+        "existing_glossary": script.glossary,
+        "dialogue": "\n".join(dialogue_lines),
+    }
+
+    if log:
+        log("Pass 0：通读全片对白，提取人物性格、称呼关系与专有名词")
+    try:
+        analysis = complete_json_object(client, SCRIPT_ANALYSIS_PROMPT, analysis_payload, temperature=0.2)
+    except Exception as exc:
+        if log:
+            log(f"Pass 0 剧本分析跳过（{exc}）")
+        return {}
+
+    styles_filled = 0
+    raw_styles = analysis.get("character_styles")
+    if isinstance(raw_styles, dict):
+        for spk, raw_style in raw_styles.items():
+            if (
+                isinstance(spk, str)
+                and isinstance(raw_style, str)
+                and raw_style.strip()
+                and spk in script.characters
+                and not (script.characters[spk].speaking_style or "").strip()
+            ):
+                script.characters[spk].speaking_style = raw_style.strip()
+                styles_filled += 1
+
+    terms_added = _merge_glossary_entries(
+        script.glossary,
+        analysis.get("glossary"),
+        protected_keys=user_glossary_keys,
+        allow_overwrite_provisional=False,
+    )
+
+    show_bible: dict = {}
+    for key in ("genre", "tone"):
+        val = analysis.get(key)
+        if isinstance(val, str) and val.strip():
+            show_bible[key] = val.strip()
+    relationships = analysis.get("relationships")
+    if isinstance(relationships, list):
+        cleaned_rel = [str(item).strip() for item in relationships if isinstance(item, str) and item.strip()]
+        if cleaned_rel:
+            show_bible["relationships"] = cleaned_rel
+    if isinstance(raw_styles, dict):
+        cleaned_styles = {
+            str(k).strip(): str(v).strip()
+            for k, v in raw_styles.items()
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
+        }
+        if cleaned_styles:
+            show_bible["character_styles"] = cleaned_styles
+
+    if log:
+        log(f"Pass 0 完成：自动补全 {styles_filled} 个角色风格，新增 {terms_added} 条术语")
+
+    raw_uncertain = analysis.get("uncertain_terms")
+    uncertain_terms = [
+        item.strip()
+        for item in (raw_uncertain if isinstance(raw_uncertain, list) else [])
+        if isinstance(item, str) and item.strip()
+    ][:8]
+
+    if enable_web_search and uncertain_terms:
+        if log:
+            log(f"Pass 0.5：联网核查 {len(uncertain_terms)} 个专有名词/典故（{', '.join(uncertain_terms)}）")
+        try:
+            hits = web_search.search_terms(
+                uncertain_terms,
+                source_lang=script.source_lang,
+                target_lang=target_lang,
+            )
+            if hits:
+                if log:
+                    log(f"联网命中 {len(hits)} 个词条参考，正在结合语境校对译名")
+                refine_payload = {
+                    "source_lang": script.source_lang,
+                    "target_lang": target_lang,
+                    "uncertain_terms": uncertain_terms,
+                    "existing_glossary": script.glossary,
+                    "web_results": hits,
+                }
+                refined = complete_json_object(client, GLOSSARY_WEB_REFINE_PROMPT, refine_payload, temperature=0.2)
+                verified_added = _merge_glossary_entries(
+                    script.glossary,
+                    refined.get("glossary"),
+                    protected_keys=user_glossary_keys,
+                    allow_overwrite_provisional=True,
+                )
+                notes = refined.get("background_notes")
+                if isinstance(notes, list):
+                    cleaned_notes = [str(n).strip() for n in notes if isinstance(n, str) and n.strip()]
+                    if cleaned_notes:
+                        show_bible["background_notes"] = cleaned_notes
+                if log:
+                    log(f"Pass 0.5 完成：联网确认/更新 {verified_added} 条专有名词译法")
+            elif log:
+                log("Pass 0.5：未检索到可用外部条目，沿用语境译法")
+        except Exception as exc:
+            if log:
+                log(f"Pass 0.5 联网校对跳过（{exc}）")
+
+    return show_bible
+
+
+def _polish_batch(
+    client: OpenAI,
+    context: DialogueContext,
+    batch: list[Segment],
+    *,
+    full_segments: list[Segment],
+    log: Callable[[str], None] | None = None,
+) -> int:
+    """Run Pass 2 dubbing polish on completed segments, keeping Pass 1 draft on any guard failure."""
+    targets = [seg for seg in batch if not seg.keep_original and seg.target_text.strip()]
+    if not targets:
+        return 0
+    allowed_ids = {seg.id for seg in targets}
+    seg_by_id = {seg.id: seg for seg in targets}
+    payload = context.polish_payload(targets, full_segments=full_segments)
+    try:
+        entries = complete_dialogue(client, DIALOGUE_POLISH_PROMPT, payload, temperature=0.55)
+    except (OpenAIError, ValueError, IndexError, json.JSONDecodeError) as exc:
+        if log:
+            log(f"Pass 2 口语润色跳过（保留初译）：{exc}")
+        return 0
+
+    polished_count = 0
+    seen: set[int] = set()
+    for entry in entries:
+        seg_id = entry.get("id")
+        text = entry.get("target_text")
+        if type(seg_id) is not int or seg_id not in allowed_ids or seg_id in seen:
+            continue
+        seen.add(seg_id)
+        if not isinstance(text, str) or not text.strip():
+            continue
+        seg = seg_by_id[seg_id]
+        complete, omitted = _self_check_flags(entry, require=True)
+        if not complete or omitted:
+            continue
+        if _fidelity_issues(seg, text, context.script.glossary, include_length=False):
+            continue
+        if _apply_translation(seg, text, entry, preserve_metadata=True):
+            polished_count += 1
+    return polished_count
+
+
 def translate_script(
     script: ProjectScript,
     client: OpenAI,
     log: Callable[[str], None] | None = None,
     errors: list[str] | None = None,
+    *,
+    enable_analysis: bool = False,
+    enable_polish: bool = False,
+    enable_web_search: bool = False,
 ) -> list[int]:
     acoustic_hints: dict[int, dict] = {}
     if script.media.vocals_wav:
@@ -364,10 +661,24 @@ def translate_script(
             acoustic_hints = extract_segment_acoustics(script, use_ser=True, allow_gpu_ser=False)
         except Exception:
             acoustic_hints = {}
-    context = DialogueContext(script, acoustic_hints=acoustic_hints)
-    segments = [seg for seg in context.ordered if seg.orig_text.strip()]
-    if not segments:
+    ordered_segments = [seg for seg in sorted(script.segments, key=lambda seg: (seg.start, seg.id)) if seg.orig_text.strip()]
+    if not ordered_segments:
         return []
+
+    target_lang = next((seg.target_lang for seg in ordered_segments if seg.target_lang), "zh")
+    show_bible: dict = {}
+    if enable_analysis or enable_web_search:
+        show_bible = _analyze_script(
+            script,
+            ordered_segments,
+            client,
+            target_lang=target_lang,
+            enable_web_search=enable_web_search,
+            log=log,
+        )
+
+    context = DialogueContext(script, acoustic_hints=acoustic_hints, show_bible=show_bible)
+    segments = [seg for seg in context.ordered if seg.orig_text.strip()]
 
     chunk_size = max(1, config.TRANSLATION_CHUNK_SIZE)
     batch_count = (len(segments) + chunk_size - 1) // chunk_size
@@ -434,27 +745,32 @@ def translate_script(
             _batch_error(errors, f"片段 #{seg_id} 未在本批次返回，保留上一版")
 
         previous_ids |= batch_ids
-        if not suspicious:
-            continue
+        if suspicious:
+            repaired = _repair_entries(client, context, suspicious, errors)
+            for seg, entry in suspicious:
+                repair_entry = repaired.get(seg.id)
+                text = repair_entry.get("target_text") if repair_entry else None
+                issues = _fidelity_issues(seg, text or "", script.glossary, include_length=False)
+                reasons = "、".join(issues) if text else "未返回修复结果"
+                hard_issues = [issue for issue in issues if not issue.startswith("译文过短")]
+                self_ok, self_note = _self_check_flags(repair_entry or {}, require=bool(repair_entry))
+                if self_note:
+                    hard_issues.append(f"self_check 标注遗漏：{self_note}")
+                if not self_ok:
+                    hard_issues.append("self_check.semantic_complete 非 true")
+                if not text or hard_issues:
+                    _batch_error(errors, f"片段 #{seg.id} 修复后仍存在明确漏译或未通过自检（{reasons}），保留上一版")
+                    continue
+                # Repair output is validated and applied without changing any metadata.
+                if seg.id not in completed_ids and _apply_translation(seg, text, repair_entry, preserve_metadata=True):
+                    completed_ids.add(seg.id)
+                    translated.append(seg.id)
 
-        repaired = _repair_entries(client, context, suspicious, errors)
-        for seg, entry in suspicious:
-            repair_entry = repaired.get(seg.id)
-            text = repair_entry.get("target_text") if repair_entry else None
-            issues = _fidelity_issues(seg, text or "", script.glossary, include_length=False)
-            reasons = "、".join(issues) if text else "未返回修复结果"
-            hard_issues = [issue for issue in issues if not issue.startswith("译文过短")]
-            self_ok, self_note = _self_check_flags(repair_entry or {}, require=bool(repair_entry))
-            if self_note:
-                hard_issues.append(f"self_check 标注遗漏：{self_note}")
-            if not self_ok:
-                hard_issues.append("self_check.semantic_complete 非 true")
-            if not text or hard_issues:
-                _batch_error(errors, f"片段 #{seg.id} 修复后仍存在明确漏译或未通过自检（{reasons}），保留上一版")
-                continue
-            # Repair output is validated and applied without changing any metadata.
-            if seg.id not in completed_ids and _apply_translation(seg, text, repair_entry, preserve_metadata=True):
-                completed_ids.add(seg.id)
-                translated.append(seg.id)
+        if enable_polish:
+            polish_candidates = [seg for seg in batch if seg.id in completed_ids and not seg.keep_original]
+            if polish_candidates:
+                polished = _polish_batch(client, context, polish_candidates, full_segments=segments, log=log)
+                if log and polished:
+                    log(f"Pass 2 完成：口语润色片段 #{batch[0].id}..#{batch[-1].id} 共 {polished}/{len(polish_candidates)} 条")
 
     return sorted(set(translated))

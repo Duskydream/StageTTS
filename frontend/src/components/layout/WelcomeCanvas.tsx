@@ -1,4 +1,4 @@
-import { ChevronRight, Clapperboard, FolderOpen, Play, Upload } from "lucide-react";
+import { ChevronRight, Clapperboard, FolderOpen, Upload } from "lucide-react";
 import type React from "react";
 import { useRef, useState } from "react";
 import { useProjectStore } from "../../store/useProjectStore";
@@ -12,7 +12,6 @@ export const WelcomeCanvas: React.FC = () => {
   const isLoading = useProjectStore((s) => s.isLoading);
   const importMediaFile = useProjectStore((s) => s.importMediaFile);
   const loadProjectScript = useProjectStore((s) => s.loadProjectScript);
-  const loadDemoProject = useProjectStore((s) => s.loadDemoProject);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -86,19 +85,6 @@ export const WelcomeCanvas: React.FC = () => {
               <div className="flex items-center gap-2">
                 <Upload className="h-4 w-4 text-secondary group-hover:text-primary" strokeWidth={1.5} />
                 <span className="font-medium text-primary">导入媒体</span>
-              </div>
-              <ChevronRight className="h-3.5 w-3.5 text-muted group-hover:text-primary" strokeWidth={1.5} />
-            </button>
-
-            <button
-              type="button"
-              disabled={isLoading}
-              onClick={() => void loadDemoProject()}
-              className="group flex w-full items-center justify-between rounded-[4px] px-2.5 py-2 text-left transition-colors hover:bg-[#2C2C2C] disabled:opacity-50"
-            >
-              <div className="flex items-center gap-2">
-                <Play className="h-4 w-4 text-secondary group-hover:text-primary" strokeWidth={1.5} />
-                <span className="font-medium text-primary">演示样例</span>
               </div>
               <ChevronRight className="h-3.5 w-3.5 text-muted group-hover:text-primary" strokeWidth={1.5} />
             </button>

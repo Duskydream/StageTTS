@@ -5,15 +5,7 @@ import { memo, useRef } from "react";
 import { useProjectStore } from "../../store/useProjectStore";
 import { type StageFlowNode, useWorkflowStore } from "../../store/useWorkflowStore";
 import type { StemVolumes, SubtitleBurnMode } from "../../types/script";
-import type { NodeCategory, NodeRunStatus } from "../../types/workflow";
-
-const CATEGORY_LINE: Record<NodeCategory, string> = {
-  input: "#B08276",
-  parse: "#9A80A6",
-  hub: "#B59A64",
-  synthesis: "#649C91",
-  output: "#6D94B6",
-};
+import type { NodeRunStatus } from "../../types/workflow";
 
 const STATUS_DOT: Record<NodeRunStatus, string> = {
   idle: "bg-[#666666]",
@@ -23,15 +15,7 @@ const STATUS_DOT: Record<NodeRunStatus, string> = {
   error: "bg-status-error",
 };
 
-const PORT_COLOR: Record<string, string> = {
-  MEDIA: "!bg-[#B08276] !border-[#181818]",
-  AUDIO: "!bg-[#9A80A6] !border-[#181818]",
-  "AUDIO[]": "!bg-[#649C91] !border-[#181818]",
-  SEGMENTS: "!bg-[#A58BB0] !border-[#181818]",
-  JSON: "!bg-[#B59A64] !border-[#181818]",
-  SCRIPT: "!bg-[#B59A64] !border-[#181818]",
-  MP4: "!bg-[#6D94B6] !border-[#181818]",
-};
+const NEUTRAL_PORT_CLASS = "!h-2 !w-2 !border !bg-[#7A7A7A] !border-[#181818]";
 
 function formatDurationShort(sec: number | undefined): string {
   if (!sec || !Number.isFinite(sec)) return "00:00";
@@ -165,6 +149,36 @@ const NodeInlineOptions: React.FC<{ nodeId: string }> = ({ nodeId }) => {
             </select>
           </div>
         )}
+        <div className="flex items-center justify-between gap-2 pt-0.5 text-[10px] text-secondary">
+          <label
+            className="flex cursor-pointer items-center gap-1"
+            title="翻译前通读全片提取人物性格与术语，翻译后按配音气口做口语润色"
+          >
+            <input
+              type="checkbox"
+              aria-label="口语润色"
+              disabled={isPipelineRunning}
+              checked={pipelineConfig.naturalPolish}
+              onChange={(e) => updatePipelineConfig({ naturalPolish: e.target.checked })}
+              className="h-3 w-3"
+            />
+            <span>口语润色</span>
+          </label>
+          <label
+            className="flex cursor-pointer items-center gap-1"
+            title="翻译前对人名、作品专名与网络典故执行免费联网检索校对译名"
+          >
+            <input
+              type="checkbox"
+              aria-label="联网校对"
+              disabled={isPipelineRunning}
+              checked={pipelineConfig.webSearch}
+              onChange={(e) => updatePipelineConfig({ webSearch: e.target.checked })}
+              className="h-3 w-3"
+            />
+            <span>联网校对</span>
+          </label>
+        </div>
       </div>
     );
   }
@@ -238,7 +252,8 @@ const NodeInlineOptions: React.FC<{ nodeId: string }> = ({ nodeId }) => {
             className={selectCls}
           >
             <option value="none">无</option>
-            <option value="target">单语</option>
+            <option value="source">原文（识别）</option>
+            <option value="target">译文</option>
             <option value="bilingual">双语</option>
           </select>
         </div>
@@ -300,10 +315,9 @@ const NodeInlineOptions: React.FC<{ nodeId: string }> = ({ nodeId }) => {
 };
 
 /**
- * ComfyUI 线框着色节点（统一 #181818 哑光底 + 分类色边框/顶线 + 内联参数区）。
+ * ComfyUI 极简中性节点卡片（无分类色标记，仅保留状态指示与连线配色）。
  */
 export const StageNode: React.FC<NodeProps<StageFlowNode>> = memo(({ id, data, selected }) => {
-  const lineColor = CATEGORY_LINE[data.category];
   const rowCount = Math.max(data.inputs.length, data.outputs.length, 1);
   const borderColor =
     data.status === "running"
@@ -311,17 +325,16 @@ export const StageNode: React.FC<NodeProps<StageFlowNode>> = memo(({ id, data, s
       : data.status === "error"
         ? "#C95252"
         : selected
-          ? lineColor
-          : `${lineColor}6B`;
+          ? "rgba(255, 255, 255, 0.45)"
+          : "rgba(255, 255, 255, 0.1)";
 
   return (
     <div
       style={{
         borderColor,
-        borderTopColor: data.status === "running" ? "#4FA882" : lineColor,
-        boxShadow: selected ? `0 0 0 1px ${lineColor}` : undefined,
+        boxShadow: selected ? "0 0 0 1px rgba(255, 255, 255, 0.28)" : undefined,
       }}
-      className="w-[244px] overflow-hidden rounded-[6px] border border-t-2 bg-[#181818] transition-colors"
+      className="w-[244px] overflow-hidden rounded-[6px] border bg-[#181818] transition-colors"
     >
       {/* 顶栏（#1E1E1E 中性暗灰 + 状态点 + VRAM 数值） */}
       <div className="flex items-center justify-between border-b border-white/[0.06] bg-[#1E1E1E] px-2.5 py-1.5">
@@ -350,7 +363,7 @@ export const StageNode: React.FC<NodeProps<StageFlowNode>> = memo(({ id, data, s
                     id={inputPort.id}
                     type="target"
                     position={Position.Left}
-                    className={`!h-2 !w-2 !border ${PORT_COLOR[inputPort.type] ?? "!bg-[#888888] !border-[#181818]"}`}
+                    className={NEUTRAL_PORT_CLASS}
                   />
                   <span className="text-secondary">{inputPort.label}</span>
                 </div>
@@ -365,7 +378,7 @@ export const StageNode: React.FC<NodeProps<StageFlowNode>> = memo(({ id, data, s
                     id={outputPort.id}
                     type="source"
                     position={Position.Right}
-                    className={`!h-2 !w-2 !border ${PORT_COLOR[outputPort.type] ?? "!bg-[#888888] !border-[#181818]"}`}
+                    className={NEUTRAL_PORT_CLASS}
                   />
                 </div>
               ) : (

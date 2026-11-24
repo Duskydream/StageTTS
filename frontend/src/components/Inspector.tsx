@@ -598,13 +598,34 @@ export const Inspector: React.FC = () => {
 
             {hasPendingReview && (
               <div className="flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  className="rounded border border-white/[0.12] bg-[#2C2C2C] px-2 py-0.5 text-[10px] text-primary hover:bg-[#383838] disabled:opacity-40"
+                  disabled={editsDisabled || !segment.orig_text.trim()}
+                  onClick={() =>
+                    updateSegmentLocal({
+                      id: segment.id,
+                      segment_timing_needs_review: false,
+                      alignment_needs_review: false,
+                      ...(script.characters[segment.speaker] && segment.speaker !== "UNKNOWN"
+                        ? { speaker: segment.speaker }
+                        : {}),
+                    })
+                  }
+                >
+                  确认本句
+                </button>
                 {segment.segment_timing_needs_review !== false && (
                   <button
                     type="button"
                     className="rounded border border-white/[0.08] bg-[#282828] px-2 py-0.5 text-[10px] text-status-warning hover:text-primary disabled:opacity-40"
                     disabled={editsDisabled || !segment.orig_text.trim()}
                     onClick={() =>
-                      updateSegmentLocal({ id: segment.id, segment_timing_needs_review: false })
+                      updateSegmentLocal({
+                        id: segment.id,
+                        segment_timing_needs_review: false,
+                        ...(segment.words?.length ? {} : { alignment_needs_review: false }),
+                      })
                     }
                   >
                     确认边界

@@ -45,6 +45,48 @@ export class ApiError extends Error {
 
 export const apiClient = createClient<paths>({ baseUrl: "" });
 
+function formatApiErrorDetail(raw: unknown, status: number): string {
+  if (typeof raw === "string" && raw.trim()) {
+    return raw.trim();
+  }
+  if (Array.isArray(raw)) {
+    const items = raw
+      .map((item) => {
+        if (typeof item === "string") return item.trim();
+        if (item && typeof item === "object") {
+          const rec = item as { loc?: unknown[]; msg?: unknown; message?: unknown };
+          const path = Array.isArray(rec.loc)
+            ? rec.loc.filter((part) => part !== "body").join(".")
+            : "";
+          const msg =
+            typeof rec.msg === "string"
+              ? rec.msg
+              : typeof rec.message === "string"
+                ? rec.message
+                : JSON.stringify(item);
+          return path ? `${path}: ${msg}` : msg;
+        }
+        return String(item);
+      })
+      .filter(Boolean);
+    if (items.length > 0) {
+      return items.join("；");
+    }
+  }
+  if (raw && typeof raw === "object") {
+    const rec = raw as { detail?: unknown; message?: unknown; msg?: unknown };
+    if (typeof rec.detail === "string" && rec.detail.trim()) return rec.detail.trim();
+    if (typeof rec.message === "string" && rec.message.trim()) return rec.message.trim();
+    if (typeof rec.msg === "string" && rec.msg.trim()) return rec.msg.trim();
+    try {
+      return JSON.stringify(raw);
+    } catch {
+      // ignore serialization failure
+    }
+  }
+  return `请求失败 (${status})`;
+}
+
 async function unwrap<T>(
   promise: Promise<{ data?: T; error?: unknown; response: Response }>,
 ): Promise<T> {
@@ -58,11 +100,8 @@ async function unwrap<T>(
   }
 
   if (!result.response.ok || result.error !== undefined || result.data === undefined) {
-    let detail = `请求失败 (${result.response.status})`;
-    const errObj = result.error as { detail?: string } | undefined;
-    if (errObj?.detail) {
-      detail = errObj.detail;
-    }
+    const errObj = result.error as { detail?: unknown } | undefined;
+    const detail = formatApiErrorDetail(errObj?.detail ?? result.error, result.response.status);
     throw new ApiError(detail, result.response.status);
   }
 
@@ -83,6 +122,48 @@ export function applyInferenceBaseModel(
   return unwrap(
     apiClient.PUT("/api/settings/training/inference", { body: { base_model: baseModel } }),
   );
+}
+
+export type TtsEngineId = "gpt_sovits" | "cosyvoice3";
+
+export interface TtsEngineOption {
+  id: TtsEngineId;
+  label: string;
+  available: boolean;
+  missing_files: string[];
+}
+
+export interface TtsSettingsResponse {
+  engine: TtsEngineId;
+  engines: TtsEngineOption[];
+}
+
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(url, init);
+  } catch (err) {
+    throw new ApiError(err instanceof Error ? err.message : "无法连接到 StageTTS 后端服务", 0, {
+      isNetworkError: true,
+    });
+  }
+  const payload = (await response.json().catch(() => null)) as { detail?: string } | null;
+  if (!response.ok || payload === null) {
+    throw new ApiError(payload?.detail || `请求失败 (${response.status})`, response.status);
+  }
+  return payload as T;
+}
+
+export function fetchTtsSettings(): Promise<TtsSettingsResponse> {
+  return requestJson<TtsSettingsResponse>("/api/settings/tts", { cache: "no-store" });
+}
+
+export function saveTtsEngine(engine: TtsEngineId): Promise<TtsSettingsResponse> {
+  return requestJson<TtsSettingsResponse>("/api/settings/tts", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ engine }),
+  });
 }
 
 export type LLMSettings = components["schemas"]["LLMSettingsResponse"];
@@ -209,7 +290,11 @@ export function fetchFinetuneStatus(
 
 export function translateProject(
   projectId: string,
-  options?: { target_lang?: string | null },
+  options?: {
+    target_lang?: string | null;
+    natural_polish?: boolean;
+    web_search?: boolean;
+  },
 ): Promise<TranslationResponse> {
   return unwrap(
     apiClient.POST("/api/projects/{project_id}/translate", {
@@ -221,7 +306,12 @@ export function translateProject(
 
 export function parseProjectMedia(
   projectId: string,
-  options: { target_lang: string; source_lang?: string | null },
+  options: {
+    target_lang: string;
+    source_lang?: string | null;
+    natural_polish?: boolean;
+    web_search?: boolean;
+  },
 ): Promise<ProjectScript> {
   return unwrap(
     apiClient.POST("/api/projects/{project_id}/parse", {
@@ -231,6 +321,8 @@ export function parseProjectMedia(
         source_lang: options.source_lang && ["zh", "en", "ja", "ko", "yue"].includes(options.source_lang)
           ? options.source_lang as "zh" | "en" | "ja" | "ko" | "yue"
           : undefined,
+        natural_polish: options.natural_polish,
+        web_search: options.web_search,
       },
     }),
   );

@@ -1018,6 +1018,18 @@ export interface components {
              * @default zh
              */
             target_lang: string;
+            /**
+             * Natural Polish
+             * @description 是否启用全片剧本分析与口语润色
+             * @default true
+             */
+            natural_polish?: boolean;
+            /**
+             * Web Search
+             * @description 是否启用联网校对专有名词与译名
+             * @default false
+             */
+            web_search?: boolean;
         };
         /**
          * ParseStatusResponse
@@ -1275,16 +1287,16 @@ export interface components {
             burn_watermark: boolean;
             /**
              * Burn Subtitles
-             * @description 是否将 ASS 字幕烧录进成片画面：none / target / bilingual
+             * @description 是否将 ASS 字幕烧录进成片画面：none / source / target / bilingual
              * @default none
              * @enum {string}
              */
-            burn_subtitles: "none" | "target" | "bilingual";
+            burn_subtitles: "none" | "source" | "target" | "bilingual";
             /**
              * Export Ass Sidecar
-             * @description 可选：同步导出同名外挂 ASS 字幕（target / bilingual）
+             * @description 可选：同步导出同名外挂 ASS 字幕（source / target / bilingual）
              */
-            export_ass_sidecar?: ("target" | "bilingual") | null;
+            export_ass_sidecar?: ("source" | "target" | "bilingual") | null;
             /**
              * Auto Ducking
              * @description 是否启用 BGM 自动闪避；为空时沿用 script.media.auto_ducking
@@ -1319,7 +1331,7 @@ export interface components {
              * @default none
              * @enum {string}
              */
-            burn_subtitles: "none" | "target" | "bilingual";
+            burn_subtitles: "none" | "source" | "target" | "bilingual";
             /**
              * Auto Ducking
              * @default true
@@ -1863,6 +1875,18 @@ export interface components {
              * @description Override target language for successfully translated segments only; omit to keep each segment language
              */
             target_lang?: string | null;
+            /**
+             * Natural Polish
+             * @description 是否启用全片剧本分析与口语润色
+             * @default false
+             */
+            natural_polish?: boolean;
+            /**
+             * Web Search
+             * @description 是否启用联网校对专有名词与译名
+             * @default false
+             */
+            web_search?: boolean;
         };
         /** TranslationResponse */
         TranslationResponse: {

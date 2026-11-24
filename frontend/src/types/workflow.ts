@@ -59,6 +59,8 @@ export interface PipelineConfig {
   targetLang: "zh" | "en" | "ja";
   burnWatermark: boolean;
   burnSubtitles: SubtitleBurnMode;
+  naturalPolish: boolean;
+  webSearch: boolean;
 }
 
 export interface PipelineLogEntry {

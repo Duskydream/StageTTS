@@ -894,7 +894,14 @@ def _build_and_save_script(
     if args.skip_llm or not config.is_llm_configured():
         _log("Stage4", "跳过翻译或未配置 LLM，保留识别原文")
     elif segments:
-        translated = translate_script(script, create_openai_client(), lambda message: _log("Stage4", message))
+        translated = translate_script(
+            script,
+            create_openai_client(),
+            lambda message: _log("Stage4", message),
+            enable_analysis=(not args.no_natural_polish) or args.web_search,
+            enable_polish=not args.no_natural_polish,
+            enable_web_search=args.web_search,
+        )
         _log("Stage4", f"已翻译 {len(translated)}/{len(segments)} 条台词")
         if script.source_lang:
             try:
@@ -948,6 +955,8 @@ def parse_args() -> argparse.Namespace:
                         help="解析后端，默认 PARSE_BACKEND=moss；legacy 为显式旧链回滚")
     parser.add_argument("--skip-diarization", action="store_true", help="仅 legacy：跳过 pyannote 说话人聚类")
     parser.add_argument("--skip-llm", action="store_true", help="跳过 LLM 翻译与情绪标注")
+    parser.add_argument("--no-natural-polish", action="store_true", help="关闭全片剧本分析与口语润色（仅单轮直译）")
+    parser.add_argument("--web-search", action="store_true", help="翻译前联网校对专有名词与译名")
     return parser.parse_args()
 
 

@@ -6,7 +6,7 @@ import tempfile
 import wave
 from collections import defaultdict
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -46,10 +46,21 @@ def reset_active_weights_cache() -> None:
     _restore_weights.clear()
 
 
+def _active_tts_engine() -> str:
+    from backend.services.tts_settings import read_tts_engine
+
+    return read_tts_engine()
+
+
+def _tts_base_url(engine: str | None = None) -> str:
+    selected = engine or _active_tts_engine()
+    return config.COSYVOICE3_API_URL if selected == "cosyvoice3" else config.TTS_API_URL
+
+
 def check_tts_service(timeout: float = 1.5) -> bool:
-    """快速探测 GPT-SoVITS api_v2.py 是否在线。"""
+    """快速探测当前已选配音推理服务是否在线。"""
     try:
-        resp = httpx.get(f"{config.TTS_API_URL}/", timeout=timeout)
+        resp = httpx.get(f"{_tts_base_url()}/", timeout=timeout)
         return resp.status_code < 500
     except httpx.HTTPError:
         return False
@@ -192,9 +203,14 @@ def _synthesize_single_line(
     ref_path: Path,
     out_wav: Path,
     glossary: dict[str, str] | None = None,
+    *,
+    api_url: str | None = None,
+    engine: str = "gpt_sovits",
 ) -> None:
     text_lang = normalize_tts_lang(seg.target_lang)
     prompt_lang = normalize_tts_lang(ref.lang)
+    base_url = (api_url or _tts_base_url(engine)).rstrip("/")
+    label = "CosyVoice 3" if engine == "cosyvoice3" else "GPT-SoVITS"
     payload = {
         "text": prepare_tts_text(seg.target_text, text_lang, glossary),
         "text_lang": text_lang,
@@ -212,13 +228,13 @@ def _synthesize_single_line(
     }
     try:
         resp = client.post(
-            f"{config.TTS_API_URL}/tts",
+            f"{base_url}/tts",
             json=payload,
             timeout=config.TTS_TIMEOUT_SEC,
         )
     except httpx.HTTPError as exc:
         raise TTSServiceUnavailableError(
-            f"无法连接 GPT-SoVITS 服务 ({config.TTS_API_URL})，请确认已启动 api_v2.py: {exc}"
+            f"无法连接 {label} 服务 ({base_url})，请确认推理服务已启动: {exc}"
         ) from exc
 
     if resp.status_code != 200:
@@ -291,34 +307,39 @@ def synthesize_segments_grouped(
     if not eligible_groups:
         return [], errors
 
+    engine = _active_tts_engine()
+    api_url = _tts_base_url(engine)
+
     with gpu_task_guard():
         try:
-            ensure_tts_running()
+            ensure_tts_running(engine=engine)
         except RuntimeError as exc:
             raise TTSServiceUnavailableError(str(exc)) from exc
+        weight_scope = _weight_scope if engine == "gpt_sovits" else (lambda *_args: nullcontext({}))
         with (
             httpx.Client() as session,
             tempfile.TemporaryDirectory(dir=tts_dir) as tmp_name,
-            _weight_scope(session, errors) as default_weights,
+            weight_scope(session, errors) as default_weights,
         ):
             tmp_dir = Path(tmp_name)
             for speaker, segs in eligible_groups.items():
                 character = script.characters.get(speaker)
-                try:
-                    _switch_weights(
-                        session, default_weights,
-                        character.gpt_weights if character else None,
-                        character.sovits_weights if character else None,
-                    )
-                except TTSServiceUnavailableError:
-                    for seg in segs:
-                        seg.status = "error"
-                    raise
-                except RuntimeError as exc:
-                    for seg in segs:
-                        seg.status = "error"
-                        errors.append(f"片段 #{seg.id} 加载角色权重失败：{exc}")
-                    continue
+                if engine == "gpt_sovits":
+                    try:
+                        _switch_weights(
+                            session, default_weights,
+                            character.gpt_weights if character else None,
+                            character.sovits_weights if character else None,
+                        )
+                    except TTSServiceUnavailableError:
+                        for seg in segs:
+                            seg.status = "error"
+                        raise
+                    except RuntimeError as exc:
+                        for seg in segs:
+                            seg.status = "error"
+                            errors.append(f"片段 #{seg.id} 加载角色权重失败：{exc}")
+                        continue
 
                 for seg in segs:
                     if not seg.target_text.strip():
@@ -330,7 +351,16 @@ def synthesize_segments_grouped(
                     try:
                         ref_obj, ref_path = resolved_refs[(speaker, seg.emotion)]
                         raw_wav = tmp_dir / out_name
-                        _synthesize_single_line(session, seg, ref_obj, ref_path, raw_wav, script.glossary)
+                        _synthesize_single_line(
+                            session,
+                            seg,
+                            ref_obj,
+                            ref_path,
+                            raw_wav,
+                            script.glossary,
+                            api_url=api_url,
+                            engine=engine,
+                        )
                         finished_wav = apply_gentle_tempo(raw_wav, seg.speed_factor, tmp_dir)
                         actual_duration = measure_wav_duration(finished_wav)
                         if actual_duration <= 0:

@@ -83,6 +83,10 @@ class _StageTTSSettingsFields(BaseModel):
     tts_api_url: str = Field(default="http://127.0.0.1:9880", alias="TTS_API_URL")
     tts_default_gpt_weights: str = Field(default="", alias="TTS_DEFAULT_GPT_WEIGHTS")
     tts_default_sovits_weights: str = Field(default="", alias="TTS_DEFAULT_SOVITS_WEIGHTS")
+    cosyvoice3_root_raw: str = Field(default="", alias="COSYVOICE3_ROOT")
+    cosyvoice3_python_raw: str = Field(default="", alias="COSYVOICE3_PYTHON")
+    cosyvoice3_model_dir_raw: str = Field(default="", alias="COSYVOICE3_MODEL_DIR")
+    cosyvoice3_api_url: str = Field(default="http://127.0.0.1:9881", alias="COSYVOICE3_API_URL")
 
     hf_home: str = Field(default="", alias="HF_HOME")
     huggingface_hub_cache: str = Field(default="", alias="HUGGINGFACE_HUB_CACHE")
@@ -202,6 +206,10 @@ TRANSLATION_CHUNK_SIZE: int = 25
 TTS_API_URL: str = settings.tts_api_url.rstrip("/")
 TTS_DEFAULT_GPT_WEIGHTS: str = settings.tts_default_gpt_weights.strip()
 TTS_DEFAULT_SOVITS_WEIGHTS: str = settings.tts_default_sovits_weights.strip()
+COSYVOICE3_ROOT: Optional[Path] = _resolve_optional_dir_path(settings.cosyvoice3_root_raw)
+COSYVOICE3_PYTHON: str = settings.cosyvoice3_python_raw.strip()
+COSYVOICE3_MODEL_DIR: Optional[Path] = _resolve_optional_path(settings.cosyvoice3_model_dir_raw)
+COSYVOICE3_API_URL: str = settings.cosyvoice3_api_url.strip().rstrip("/") or "http://127.0.0.1:9881"
 
 # 可选模型缓存路径（用于重定向至非 C 盘目录）
 HF_HOME: str = settings.hf_home.strip()

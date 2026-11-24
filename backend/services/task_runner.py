@@ -76,13 +76,25 @@ _gpu_task_lock = GpuTaskLock()
 # ---------------------------------------------------------------------------
 _tts_proc_lock = threading.Lock()
 _tts_proc: Optional[subprocess.Popen[Any]] = None
+_active_tts_engine: Optional[str] = None
 _tts_log_fp: Optional[Any] = None
 _tts_config_dir: tempfile.TemporaryDirectory | None = None
 
 
-def _probe_tts_ready(timeout: float = 1.0) -> bool:
+def _active_tts_engine_id() -> str:
+    from backend.services.tts_settings import read_tts_engine
+
+    return read_tts_engine()
+
+
+def _tts_url_for_engine(engine: str) -> str:
+    return config.COSYVOICE3_API_URL if engine == "cosyvoice3" else config.TTS_API_URL
+
+
+def _probe_tts_ready(timeout: float = 1.0, api_url: str | None = None) -> bool:
+    target = (api_url or _tts_url_for_engine(_active_tts_engine_id())).rstrip("/")
     try:
-        resp = httpx.get(f"{config.TTS_API_URL}/", timeout=timeout)
+        resp = httpx.get(f"{target}/", timeout=timeout)
         return resp.status_code < 500
     except httpx.HTTPError:
         return False
@@ -147,8 +159,8 @@ def _terminate_process_tree(proc: subprocess.Popen[Any], grace_sec: float = 5.0)
 
 
 def ensure_tts_stopped() -> bool:
-    """停止后端持有的 GPT-SoVITS 进程，等它退出后才释放句柄。"""
-    global _tts_proc, _tts_log_fp, _tts_config_dir
+    """停止后端持有的 TTS 推理进程，等它退出后才释放句柄。"""
+    global _tts_proc, _active_tts_engine, _tts_log_fp, _tts_config_dir
     stopped = False
     with _tts_proc_lock:
         if _tts_proc is not None:
@@ -156,6 +168,7 @@ def ensure_tts_stopped() -> bool:
                 _terminate_process_tree(_tts_proc, grace_sec=6.0)
                 stopped = True
             _tts_proc = None
+        _active_tts_engine = None
         if _tts_log_fp is not None:
             try:
                 _tts_log_fp.close()
@@ -179,13 +192,8 @@ def ensure_tts_stopped() -> bool:
     return stopped
 
 
-def _prepare_gpu_for_parse() -> None:
-    try:
-        stopped = config.TTS_AUTO_MANAGE and ensure_tts_stopped()
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GpuBusyError("无法确认受管 GPT-SoVITS 已退出，请停止该服务后重试解析。") from exc
-
-    endpoint = urlparse(config.TTS_API_URL)
+def _loopback_endpoint_port(api_url: str) -> tuple[str, int] | None:
+    endpoint = urlparse(api_url)
     host = endpoint.hostname or "localhost"
     try:
         address = ipaddress.ip_address(host)
@@ -196,6 +204,26 @@ def _prepare_gpu_for_parse() -> None:
         address = ipaddress.ip_address(host)
     if host == "localhost" or (address and address.is_loopback):
         port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
+        return host, port
+    return None
+
+
+def _prepare_gpu_for_parse() -> None:
+    try:
+        stopped = config.TTS_AUTO_MANAGE and ensure_tts_stopped()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GpuBusyError("无法确认受管 TTS 服务已退出，请停止该服务后重试解析。") from exc
+
+    checked: set[tuple[str, int]] = set()
+    urls = [config.TTS_API_URL]
+    if config.COSYVOICE3_ROOT is not None and config.COSYVOICE3_MODEL_DIR is not None:
+        urls.append(config.COSYVOICE3_API_URL)
+    for api_url in urls:
+        local = _loopback_endpoint_port(api_url)
+        if local is None or local in checked:
+            continue
+        checked.add(local)
+        host, port = local
         try:
             with socket.create_connection((host, port), timeout=0.5):
                 pass
@@ -203,52 +231,108 @@ def _prepare_gpu_for_parse() -> None:
             pass
         else:
             raise GpuBusyError(
-                f"本机 GPT-SoVITS 端口 {port} 仍在监听，可能占用同一张显卡。"
-                "请停止手动启动的服务后重试，或将 TTS_API_URL 指向另一台机器。"
+                f"本机 TTS 端口 {port} 仍在监听，可能占用同一张显卡。"
+                "请停止手动启动的服务后重试，或将对应 API URL 指向另一台机器。"
             )
     if stopped:
-        _record_parse_line("[parse_worker][Init] 已确认受管 GPT-SoVITS 退出")
+        _record_parse_line("[parse_worker][Init] 已确认受管 TTS 服务退出")
 
 
-def ensure_tts_running() -> None:
-    """按需启动 GPT-SoVITS api_v2.py 并等待就绪；若已在线则直接复用。"""
-    global _tts_proc, _tts_log_fp, _tts_config_dir
-
-    if _probe_tts_ready(timeout=1.2):
-        return
-
-    if not config.TTS_AUTO_MANAGE:
-        return
+def _build_tts_launch_spec(
+    engine: str, host: str, port: int,
+) -> tuple[list[str], Path, tempfile.TemporaryDirectory | None] | None:
+    if engine == "cosyvoice3":
+        server_script = config.WORKERS_DIR / "cosyvoice3_server.py"
+        cv_root = config.COSYVOICE3_ROOT
+        model_dir = config.COSYVOICE3_MODEL_DIR
+        python_cmd = config.COSYVOICE3_PYTHON.strip()
+        python_valid = bool(
+            python_cmd and (Path(python_cmd).is_file() or shutil.which(python_cmd) is not None)
+        )
+        if (
+            not server_script.is_file()
+            or cv_root is None
+            or not (cv_root / "cosyvoice" / "cli" / "cosyvoice.py").is_file()
+            or model_dir is None
+            or not (model_dir / "cosyvoice3.yaml").is_file()
+            or not python_valid
+        ):
+            return None
+        cmd = [
+            python_cmd,
+            "-u",
+            str(server_script),
+            "-a",
+            host,
+            "-p",
+            str(port),
+            "--model-dir",
+            str(model_dir),
+            "--cosyvoice-root",
+            str(cv_root),
+        ]
+        return cmd, config.ROOT_DIR, None
 
     if config.GPT_SOVITS_ROOT is None:
-        return
-
+        return None
     api_script = config.GPT_SOVITS_ROOT / "api_v2.py"
     python_cmd = config.GPT_SOVITS_PYTHON.strip()
     python_valid = bool(
         python_cmd and (Path(python_cmd).is_file() or shutil.which(python_cmd) is not None)
     )
     if not api_script.is_file() or not python_valid:
+        return None
+    cmd = [python_cmd, "-u", str(api_script), "-a", host, "-p", str(port)]
+    cfg_dir: tempfile.TemporaryDirectory | None = None
+    if config.GPT_SOVITS_CONFIG and Path(config.GPT_SOVITS_CONFIG).is_file():
+        # GPT-SoVITS writes the active weights back to its config on each switch.
+        cfg_dir = tempfile.TemporaryDirectory(prefix="stagetts_tts_")
+        runtime_config = Path(cfg_dir.name) / "tts.yaml"
+        shutil.copyfile(config.GPT_SOVITS_CONFIG, runtime_config)
+        cmd.extend(["-c", str(runtime_config)])
+    return cmd, config.GPT_SOVITS_ROOT, cfg_dir
+
+
+def ensure_tts_running(engine: str | None = None) -> None:
+    """按需启动当前所选 TTS 推理服务并等待就绪；若已在线则直接复用。"""
+    global _tts_proc, _active_tts_engine, _tts_log_fp, _tts_config_dir
+
+    selected = engine or _active_tts_engine_id()
+    target_url = _tts_url_for_engine(selected)
+
+    with _tts_proc_lock:
+        switching_managed = (
+            _tts_proc is not None
+            and _tts_proc.poll() is None
+            and _active_tts_engine is not None
+            and _active_tts_engine != selected
+        )
+    if switching_managed:
+        ensure_tts_stopped()
+
+    if _probe_tts_ready(timeout=1.2, api_url=target_url):
         return
 
-    parsed = urlparse(config.TTS_API_URL)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 9880
+    if not config.TTS_AUTO_MANAGE:
+        return
 
-    cmd = [
-        python_cmd,
-        "-u",
-        str(api_script),
-        "-a",
-        host,
-        "-p",
-        str(port),
-    ]
+    parsed = urlparse(target_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (9881 if selected == "cosyvoice3" else 9880)
+    spec = _build_tts_launch_spec(selected, host, port)
+    if spec is None:
+        return
+    cmd, cwd_path, cfg_dir = spec
+    label = "CosyVoice 3" if selected == "cosyvoice3" else "GPT-SoVITS"
+
     with _tts_proc_lock:
-        if _probe_tts_ready(timeout=1.0):
+        if _probe_tts_ready(timeout=1.0, api_url=target_url):
+            if cfg_dir is not None:
+                cfg_dir.cleanup()
             return
         if _tts_proc is not None and _tts_proc.poll() is not None:
             _tts_proc = None
+            _active_tts_engine = None
         if _tts_proc is None:
             from backend.services.tts_client import reset_active_weights_cache
 
@@ -259,44 +343,39 @@ def ensure_tts_running() -> None:
             if _tts_log_fp is not None:
                 _tts_log_fp.close()
                 _tts_log_fp = None
-            if config.GPT_SOVITS_CONFIG and Path(config.GPT_SOVITS_CONFIG).is_file():
-                # GPT-SoVITS writes the active weights back to its config on each switch.
-                _tts_config_dir = tempfile.TemporaryDirectory(prefix="stagetts_tts_")
-                runtime_config = Path(_tts_config_dir.name) / "tts.yaml"
-                shutil.copyfile(config.GPT_SOVITS_CONFIG, runtime_config)
-                cmd.extend(["-c", str(runtime_config)])
+            _tts_config_dir = cfg_dir
             config.WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
             log_path = config.WORKSPACE_DIR / "_tts_server.log"
             _tts_log_fp = log_path.open("w", encoding="utf-8", errors="replace")
-            # ONNX Runtime pre-allocates large contiguous buffers for mem patterns.
-            # On 15 GB laptops the 635 MB Chinese G2P model then fails with
-            # "bad allocation"; disabling mem patterns makes it load reliably.
             tts_env = os.environ.copy()
             tts_env.setdefault("ORT_DISABLE_MEM_PATTERN", "1")
             tts_env.setdefault("PYTHONUTF8", "1")
             _tts_proc = subprocess.Popen(
                 cmd,
-                cwd=str(config.GPT_SOVITS_ROOT),
+                cwd=str(cwd_path),
                 env=tts_env,
                 stdout=_tts_log_fp,
                 stderr=subprocess.STDOUT,
                 start_new_session=os.name != "nt",
             )
+            _active_tts_engine = selected
+        elif cfg_dir is not None:
+            cfg_dir.cleanup()
 
     deadline = time.time() + config.TTS_STARTUP_TIMEOUT_SEC
     while time.time() < deadline:
-        if _probe_tts_ready(timeout=1.0):
+        if _probe_tts_ready(timeout=1.0, api_url=target_url):
             return
         with _tts_proc_lock:
             if _tts_proc is not None and _tts_proc.poll() is not None:
                 code = _tts_proc.returncode
                 raise RuntimeError(
-                    f"按需启动 GPT-SoVITS 失败 (exit={code})，请查看 workspace/_tts_server.log"
+                    f"按需启动 {label} 失败 (exit={code})，请查看 workspace/_tts_server.log"
                 )
         time.sleep(0.8)
 
     raise RuntimeError(
-        f"按需启动 GPT-SoVITS 超时（>{int(config.TTS_STARTUP_TIMEOUT_SEC)}s），请查看 workspace/_tts_server.log"
+        f"按需启动 {label} 超时（>{int(config.TTS_STARTUP_TIMEOUT_SEC)}s），请查看 workspace/_tts_server.log"
     )
 
 
@@ -463,6 +542,8 @@ def run_parse_worker(
     target_lang: str = "zh",
     mode: str = "video_dubbing",
     source_lang: str | None = None,
+    natural_polish: bool = True,
+    web_search: bool = False,
 ) -> Path:
     """启动独立 MOSS / Banquet 解析 worker（legacy 模式须显式配置；GPU 在子进程退出时回收）。
 
@@ -504,6 +585,10 @@ def run_parse_worker(
 
     if source_lang:
         cmd.extend(["--source-lang", source_lang])
+    if not natural_polish:
+        cmd.append("--no-natural-polish")
+    if web_search:
+        cmd.append("--web-search")
 
     sub_env = os.environ.copy()
     sub_env["PYTHONUTF8"] = "1"

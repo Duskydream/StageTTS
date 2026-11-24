@@ -199,17 +199,25 @@ def update_mix_settings(
 def render_final_video(
     project_id: str,
     burn_watermark: bool = False,
+    burn_subtitles: str = "none",
+    auto_fit_overflow: bool = False,
 ) -> Dict[str, Any]:
     """触发 pydub 拼轨与 FFmpeg 混音封装，输出成片路径并回写 script.json。"""
     with project_task_guard(project_id):
         script = load_project_script(project_id)
-        output_video, duration = mix_and_render(script, burn_watermark=burn_watermark)
+        output_video, duration = mix_and_render(
+            script,
+            burn_watermark=burn_watermark,
+            burn_subtitles=burn_subtitles,  # type: ignore[arg-type]
+            auto_fit_overflow=auto_fit_overflow,
+        )
         script.media.output_video = output_video
         save_project_script(script)
     return {
         "output_video": output_video,
         "duration": duration,
         "burn_watermark": burn_watermark,
+        "burn_subtitles": burn_subtitles,
     }
 
 

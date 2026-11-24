@@ -370,6 +370,7 @@ function SpeakerEditor({
   const setScript = useProjectStore((s) => s.setScript);
   const mergeCharacters = useProjectStore((s) => s.mergeCharacters);
   const batchUpdateSegments = useProjectStore((s) => s.batchUpdateSegmentsLocal);
+  const confirmAllPendingReviews = useProjectStore((s) => s.confirmAllPendingReviews);
   const selectSegment = useProjectStore((s) => s.selectSegment);
   const setCurrentTime = useProjectStore((s) => s.setCurrentTime);
 
@@ -497,6 +498,12 @@ function SpeakerEditor({
   const configuredRefCount = Object.values(character.emotion_refs).filter(
     (ref) => ref?.wav && ref.text?.trim() && ref.lang?.trim(),
   ).length;
+  const pendingReviewCount = segments.filter(
+    (seg) =>
+      seg.segment_timing_needs_review !== false ||
+      seg.alignment_needs_review !== false ||
+      (seg.speaker_needs_review !== false && seg.speaker !== "UNKNOWN"),
+  ).length;
 
   return (
     <div className="space-y-2 text-[11px]">
@@ -515,6 +522,20 @@ function SpeakerEditor({
           value={character.speaking_style ?? ""}
           onChange={(e) => updateCharacter(speaker, { speaking_style: e.target.value })}
         />
+      </div>
+
+      <div className="flex items-center justify-between gap-1.5">
+        <button
+          className={`flex flex-1 items-center justify-center gap-1 ${button}`}
+          type="button"
+          title="将该角色下所有待校对句子的时间、原文与说话人一次性标为已确认"
+          disabled={busy || speaker === "UNKNOWN" || pendingReviewCount === 0}
+          onClick={() => confirmAllPendingReviews(speaker)}
+        >
+          <span>
+            {pendingReviewCount > 0 ? `一键确认本角色 (${pendingReviewCount})` : "本角色已确认"}
+          </span>
+        </button>
       </div>
 
       <details className="space-y-2 border-t border-white/10 pt-2" open>

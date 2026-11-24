@@ -100,7 +100,11 @@ function createInitialNodes(config: PipelineConfig): StageFlowNode[] {
         inputs: [{ id: "in-turns", label: "句段", type: "SEGMENTS" }],
         outputs: [{ id: "out-script-draft", label: "初稿", type: "JSON" }],
         summary: "",
-        params: { target_lang: config.targetLang },
+        params: {
+          target_lang: config.targetLang,
+          natural_polish: config.naturalPolish,
+          web_search: config.webSearch,
+        },
       },
     },
     {
@@ -252,6 +256,8 @@ const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   targetLang: "zh",
   burnWatermark: false,
   burnSubtitles: "none",
+  naturalPolish: true,
+  webSearch: false,
 };
 
 export function workflowPreflight(script: ProjectScript, config: PipelineConfig & { startStep: PipelineStartStep }, parseOnly: boolean): string | null {
@@ -419,7 +425,18 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       const nodes = state.nodes.map((node) => {
         if (node.id === "whisperx") return { ...node, data: { ...node.data, vramGb: 2.0, summary: "BF16 · ≤90m" } };
         if (node.id === "llm_tagger") {
-          return { ...node, data: { ...node.data, params: { ...node.data.params, target_lang: nextConfig.targetLang } } };
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              params: {
+                ...node.data.params,
+                target_lang: nextConfig.targetLang,
+                natural_polish: nextConfig.naturalPolish,
+                web_search: nextConfig.webSearch,
+              },
+            },
+          };
         }
         if (node.id === "ffmpeg_mixer") return { ...node, data: { ...node.data, params: { ...node.data.params, burn_watermark: nextConfig.burnWatermark } } };
         return node;
@@ -552,7 +569,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         setActiveEdges(["e-input-banquet"]);
         get().appendLog(
           "env_parse",
-          `启动真实 4 阶段解析：项目 ${activeScript.project_id}（目标语种=${cfg.targetLang}，MOSS BF16/SDPA）`,
+          `启动真实 4 阶段解析：项目 ${activeScript.project_id}（目标语种=${cfg.targetLang}，口语润色=${cfg.naturalPolish ? "开" : "关"}，联网校对=${cfg.webSearch ? "开" : "关"}，MOSS BF16/SDPA）`,
           "info",
         );
 
@@ -633,6 +650,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
           activeScript = await parseProjectMedia(activeScript.project_id, {
             target_lang: cfg.targetLang,
             source_lang: activeScript.source_lang,
+            natural_polish: cfg.naturalPolish,
+            web_search: cfg.webSearch,
           });
         } finally {
           unsubscribeSse();
@@ -676,8 +695,16 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         activeNode = "llm_tagger";
         setNodeStatus("llm_tagger", "running");
         setActiveEdges(["e-llm-hub"]);
-        get().appendLog("env_backend", `翻译已有 ${activeScript.segments.length} 条源台词，目标语言=${cfg.targetLang}；不会调用媒体解析。`, "info");
-        const translated = await translateProject(targetProjectId, { target_lang: cfg.targetLang });
+        get().appendLog(
+          "env_backend",
+          `翻译已有 ${activeScript.segments.length} 条源台词（目标=${cfg.targetLang}，口语润色=${cfg.naturalPolish ? "开" : "关"}，联网校对=${cfg.webSearch ? "开" : "关"}）；不会调用媒体解析。`,
+          "info",
+        );
+        const translated = await translateProject(targetProjectId, {
+          target_lang: cfg.targetLang,
+          natural_polish: cfg.naturalPolish,
+          web_search: cfg.webSearch,
+        });
         activeScript = translated.script;
         if (isSameProject()) useProjectStore.getState().setScript(activeScript);
         for (const error of translated.errors ?? []) get().appendLog("env_backend", error, "warn");

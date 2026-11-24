@@ -1,5 +1,4 @@
 import { create } from "zustand";
-import { createDemoScriptCopy } from "../data/demoScript";
 import {
   ApiError,
   restoreProjectSnapshot as apiRestoreProjectSnapshot,
@@ -73,7 +72,6 @@ interface ProjectState {
   lastUndoMergeKey: { key: string; ts: number } | null;
 
   initWorkspace: () => Promise<void>;
-  loadDemoProject: () => Promise<void>;
   closeProject: () => void;
   importMediaFile: (file: File) => Promise<void>;
   setScript: (script: ProjectScript) => void;
@@ -94,7 +92,7 @@ interface ProjectState {
   mergeSegmentWithNext: (segmentId: number) => boolean;
   addSegment: (options?: { start?: number; end?: number; speaker?: string }) => number | null;
   deleteSegment: (segmentId: number) => boolean;
-  confirmAllPendingReviews: () => number;
+  confirmAllPendingReviews: (speakerKey?: string) => number;
   applyVoicePresetToCharacter: (speakerKey: string, preset: VoicePreset) => void;
   restoreSnapshot: (snapshotId: string) => Promise<boolean>;
   updateBgmVolume: (volume: number) => void;
@@ -341,50 +339,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         gpuBusy: false,
         projectList: [],
         error: null,
-        lastSyncMessage: "离线模式：可导入本地媒体或载入演示样例",
+        lastSyncMessage: "离线模式：未连接后端",
       });
     }
-  },
-
-  loadDemoProject: async () => {
-    const { backendStatus } = get();
-    set({ isLoading: true, error: null });
-    if (backendStatus === "online") {
-      try {
-        const data = await fetchProjectScript("proj_demo_01");
-        set({
-          script: data,
-          mode: data.mode,
-          selectedSegmentId: data.segments[0]?.id ?? null,
-          currentTime: 0,
-          isPlaying: false,
-          isLoading: false,
-          isDirty: false,
-          pastScripts: [],
-          futureScripts: [],
-          lastUndoMergeKey: null,
-          lastSyncMessage: "已载入项目 proj_demo_01",
-        });
-        return;
-      } catch {
-        // 若后端暂无该目录则回退内置演示剧本
-      }
-    }
-    const fresh = createDemoScriptCopy();
-    set({
-      script: fresh,
-      mode: fresh.mode,
-      selectedSegmentId: fresh.segments[0]?.id ?? null,
-      currentTime: 0,
-      isPlaying: false,
-      isLoading: false,
-      isDirty: false,
-      audioVersionMap: {},
-      pastScripts: [],
-      futureScripts: [],
-      lastUndoMergeKey: null,
-      lastSyncMessage: "已载入内置演示样例",
-    });
   },
 
   closeProject: () =>
@@ -915,7 +872,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     return true;
   },
 
-  confirmAllPendingReviews: () => {
+  confirmAllPendingReviews: (speakerKey?: string) => {
     const state = get();
     const script = state.script;
     if (!script) {
@@ -923,12 +880,19 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     }
     let confirmed = 0;
     const segments = script.segments.map((seg) => {
-      if (seg.alignment_needs_review || seg.speaker_needs_review) {
+      if (speakerKey && seg.speaker !== speakerKey) {
+        return seg;
+      }
+      const needsTiming = seg.segment_timing_needs_review !== false;
+      const needsAlign = seg.alignment_needs_review !== false;
+      const needsSpeaker = seg.speaker_needs_review !== false && seg.speaker !== "UNKNOWN";
+      if (needsTiming || needsAlign || needsSpeaker) {
         confirmed += 1;
         return {
           ...seg,
+          segment_timing_needs_review: false,
           alignment_needs_review: false,
-          speaker_needs_review: false,
+          speaker_needs_review: seg.speaker === "UNKNOWN" ? seg.speaker_needs_review : false,
         };
       }
       return seg;
@@ -936,13 +900,16 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     if (confirmed === 0) {
       return 0;
     }
+    const scopeLabel = speakerKey
+      ? `${script.characters[speakerKey]?.display_name || speakerKey} 的 ${confirmed} 条`
+      : `全部 ${confirmed} 条`;
     set({
       script: { ...script, segments },
       pastScripts: pushPastScript(state.pastScripts, script),
       futureScripts: [],
       lastUndoMergeKey: null,
       isDirty: true,
-      lastSyncMessage: `已批量确认 ${confirmed} 条待校对片段`,
+      lastSyncMessage: `已一键确认 ${scopeLabel}待校对片段`,
     });
     return confirmed;
   },
