@@ -164,15 +164,128 @@ def reference_unavailable_reason(script: ProjectScript, speaker: str) -> str:
     return prefix + "该角色没有 3–10 秒的完整句段，且没有可验证的词级时间，不能直接截取长句前几秒。请在角色设置上传 3–10 秒参考音，填写与音频一致的原文逐字稿和语种；或先将源对白切分、校对为合适句段。"
 
 
-def automatic_reference(script: ProjectScript, speaker: str) -> ReferencePreview | None:
-    reviewed = _reviewed_automatic_reference(script, speaker)
+def automatic_reference(
+    script: ProjectScript,
+    speaker: str,
+    emotion: str | None = None,
+) -> ReferencePreview | None:
+    reviewed = _reviewed_automatic_reference(script, speaker, emotion=emotion)
     if reviewed is not None:
         return reviewed
     from backend.services.automatic_moss_reference import automatic_moss_reference
-    return automatic_moss_reference(script, speaker)
+    return automatic_moss_reference(script, speaker, emotion=emotion)
 
 
-def _reviewed_automatic_reference(script: ProjectScript, speaker: str) -> ReferencePreview | None:
+def _resolve_valid_vocals_source(script: ProjectScript) -> tuple[Path, Path] | None:
+    if not script.media.vocals_wav:
+        return None
+    source = config.resolve_media_path(script.media.vocals_wav)
+    project_dir = (config.WORKSPACE_DIR / script.project_id).resolve()
+    is_banquet_dialogue = (
+        script.media.cinematic_stems is not None
+        and script.media.vocals_wav == script.media.cinematic_stems.dialogue
+        and source.name == "dialogue.wav"
+        and source.parent.name.startswith("cinematic-")
+        and source.parent.parent == project_dir
+    )
+    if source != project_dir / "vocals.wav" and not is_banquet_dialogue:
+        return None
+    return source, project_dir
+
+
+def _slice_window_to_ref(
+    script: ProjectScript,
+    source: Path,
+    project_dir: Path,
+    vocals: wave.Wave_read,
+    lang: str,
+    window_start: float,
+    window_end: float,
+    transcript: str,
+    segment_ids: list[int],
+) -> ReferencePreview | None:
+    rate, channels, width = vocals.getframerate(), vocals.getnchannels(), vocals.getsampwidth()
+    start = max(0, round(window_start * rate))
+    requested_end = round(window_end * rate)
+    end = min(requested_end, vocals.getnframes())
+    if requested_end > end:
+        # Only discard a small, proven word-free alignment margin.
+        source_end = end / rate
+        related = [seg for seg in script.segments if seg.id in segment_ids]
+        if (requested_end - end > round(0.05 * rate)
+                or not related
+                or any(_verified_word_offsets(seg) is None for seg in related)
+                or any(word.end > source_end for seg in related for word in seg.words
+                       if word.start < window_end and word.end > window_start)):
+            return None
+    if end - start < MIN_REFERENCE_SECONDS * rate or end - start > MAX_REFERENCE_SECONDS * rate:
+        return None
+    key = (str(source), source.stat().st_mtime_ns, start, end, channels, width)
+    name = f"auto_{hashlib.sha256(repr(key).encode()).hexdigest()[:24]}.wav"
+    path = project_dir / "references" / name
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=path.parent) as temp:
+            draft = Path(temp) / name
+            vocals.setpos(start)
+            frames = vocals.readframes(end - start)
+            if channels == 1 and width == 2 and rate == 32000:
+                with wave.open(str(draft), "wb") as output:
+                    output.setnchannels(1)
+                    output.setsampwidth(2)
+                    output.setframerate(32000)
+                    output.writeframes(frames)
+            else:
+                raw = Path(temp) / "raw.wav"
+                with wave.open(str(raw), "wb") as source_wav:
+                    source_wav.setnchannels(channels)
+                    source_wav.setsampwidth(width)
+                    source_wav.setframerate(rate)
+                    source_wav.writeframes(frames)
+                subprocess.run(
+                    ["ffmpeg", "-nostdin", "-v", "error", "-i", str(raw), "-ac", "1", "-ar", "32000",
+                     "-c:a", "pcm_s16le", str(draft)],
+                    check=True, capture_output=True, timeout=30,
+                )
+            draft.replace(path)
+    text = prepare_tts_text(unicodedata.normalize("NFKC", transcript), lang)
+    if not text:
+        return None
+    return ReferencePreview(
+        wav=f"/workspace/{script.project_id}/references/{name}",
+        text=text,
+        lang=lang,
+        segment_ids=segment_ids,
+    )
+
+
+def extract_confirmed_segment_reference(script: ProjectScript, seg: Segment) -> ReferencePreview | None:
+    """Slice a single confirmed segment from project vocals into references/."""
+    if seg.speaker == "UNKNOWN" or not _whole_timing_confirmed(seg) or seg.speaker_needs_review or not seg.orig_text.strip():
+        return None
+    lang = normalize_tts_lang(script.source_lang, default="")
+    if lang not in SUPPORTED_SOURCE_LANGS:
+        return None
+    resolved = _resolve_valid_vocals_source(script)
+    if resolved is None:
+        return None
+    source, project_dir = resolved
+    try:
+        with wave.open(str(source), "rb") as vocals:
+            return _slice_window_to_ref(
+                script, source, project_dir, vocals, lang,
+                seg.start, seg.end, seg.orig_text.strip(), [seg.id],
+            )
+    except (ValueError, OSError, EOFError, wave.Error, subprocess.SubprocessError):
+        return None
+
+
+def _reviewed_automatic_reference(
+    script: ProjectScript,
+    speaker: str,
+    *,
+    emotion: str | None = None,
+) -> ReferencePreview | None:
     if speaker == "UNKNOWN":
         return None
     lang = normalize_tts_lang(script.source_lang, default="")
@@ -180,7 +293,19 @@ def _reviewed_automatic_reference(script: ProjectScript, speaker: str) -> Refere
         return None
     candidates = _candidate_clips(script, speaker)
     windows: list[tuple[float, float, str, list[int]]] = []
+    seen_segment_tuples: set[tuple[int, ...]] = set()
+    if emotion:
+        from backend.services.emotion_routing import select_emotion_reference_candidates
+
+        for seg in select_emotion_reference_candidates(script, speaker, emotion):
+            if _whole_timing_confirmed(seg) and not seg.speaker_needs_review and MIN_REFERENCE_SECONDS <= seg.end - seg.start <= MAX_REFERENCE_SECONDS:
+                key = (seg.id,)
+                seen_segment_tuples.add(key)
+                windows.append((seg.start, seg.end, seg.orig_text.strip(), [seg.id]))
     for clip in candidates:
+        key = tuple(part.id for part in clip)
+        if key in seen_segment_tuples:
+            continue
         windows.append((
             clip[0].start,
             clip[-1].end,
@@ -196,72 +321,18 @@ def _reviewed_automatic_reference(script: ProjectScript, speaker: str) -> Refere
         return None
 
     try:
-        source = config.resolve_media_path(script.media.vocals_wav)
-        project_dir = (config.WORKSPACE_DIR / script.project_id).resolve()
-        is_banquet_dialogue = (
-            script.media.cinematic_stems is not None
-            and script.media.vocals_wav == script.media.cinematic_stems.dialogue
-            and source.name == "dialogue.wav"
-            and source.parent.name.startswith("cinematic-")
-            and source.parent.parent == project_dir
-        )
-        if source != project_dir / "vocals.wav" and not is_banquet_dialogue:
+        resolved = _resolve_valid_vocals_source(script)
+        if resolved is None:
             return None
+        source, project_dir = resolved
         with wave.open(str(source), "rb") as vocals:
-            rate, channels, width = vocals.getframerate(), vocals.getnchannels(), vocals.getsampwidth()
             for window_start, window_end, transcript, segment_ids in windows:
-                start = max(0, round(window_start * rate))
-                requested_end = round(window_end * rate)
-                end = min(requested_end, vocals.getnframes())
-                if requested_end > end:
-                    # Only discard a small, proven word-free alignment margin.
-                    source_end = end / rate
-                    related = [seg for seg in script.segments if seg.id in segment_ids]
-                    if (requested_end - end > round(0.05 * rate)
-                            or not related
-                            or any(_verified_word_offsets(seg) is None for seg in related)
-                            or any(word.end > source_end for seg in related for word in seg.words
-                                   if word.start < window_end and word.end > window_start)):
-                        continue
-                if end - start < MIN_REFERENCE_SECONDS * rate:
-                    continue
-                key = (str(source), source.stat().st_mtime_ns, start, end, channels, width)
-                name = f"auto_{hashlib.sha256(repr(key).encode()).hexdigest()[:24]}.wav"
-                path = project_dir / "references" / name
-                if not path.is_file():
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    with tempfile.TemporaryDirectory(dir=path.parent) as temp:
-                        draft = Path(temp) / name
-                        vocals.setpos(start)
-                        frames = vocals.readframes(end - start)
-                        if channels == 1 and width == 2 and rate == 32000:
-                            with wave.open(str(draft), "wb") as output:
-                                output.setnchannels(1)
-                                output.setsampwidth(2)
-                                output.setframerate(32000)
-                                output.writeframes(frames)
-                        else:
-                            raw = Path(temp) / "raw.wav"
-                            with wave.open(str(raw), "wb") as source_wav:
-                                source_wav.setnchannels(channels)
-                                source_wav.setsampwidth(width)
-                                source_wav.setframerate(rate)
-                                source_wav.writeframes(frames)
-                            subprocess.run(
-                                ["ffmpeg", "-nostdin", "-v", "error", "-i", str(raw), "-ac", "1", "-ar", "32000",
-                                 "-c:a", "pcm_s16le", str(draft)],
-                                check=True, capture_output=True, timeout=30,
-                            )
-                        draft.replace(path)
-                text = prepare_tts_text(unicodedata.normalize("NFKC", transcript), lang)
-                if not text:
-                    continue
-                return ReferencePreview(
-                    wav=f"/workspace/{script.project_id}/references/{name}",
-                    text=text,
-                    lang=lang,
-                    segment_ids=segment_ids,
+                preview = _slice_window_to_ref(
+                    script, source, project_dir, vocals, lang,
+                    window_start, window_end, transcript, segment_ids,
                 )
+                if preview is not None:
+                    return preview
     except (ValueError, OSError, EOFError, wave.Error, subprocess.SubprocessError):
         return None
     return None

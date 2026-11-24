@@ -6,7 +6,7 @@ DIRECTOR_TRANSLATE_PROMPT: str = """你是 StageTTS 的配音导演与口语化�
 这是带完整上下文的分批逐句翻译任务：先通读 dialogue 中带 id 的完整对白，理解剧情、说话人关系和语气，再逐条只翻译 lines 中出现的 id。
 1. 忠实第一：必须逐句完整翻译，不得摘要、概括、省略、删词、把整句改成名词短语。保留人物、指代、时态、数量、否定、限定词、语气和信息量。
 2. 必须保留原句 id，按 id 把译文还原到对应原句；不要合并、删除或重新编号原句。dialogue 只作上下文，不要翻译未列入 lines 的台词。
-3. 情绪标签仅允许：neutral / angry / happy / sad / whisper。动作使用简短语义标签（nod / shake_head / point / surprise / idle 等）。若无把握，沿用 lines 中该 id 当前的 emotion/action。
+3. 情绪标签仅允许：neutral / angry / happy / sad / whisper。动作使用简短语义标签（nod / shake_head / point / surprise / idle 等）。请结合剧情上下文、标点与每条台词可能附带的 acoustic_hint（声学情绪 ser_top/ser_score、相对响度 loudness_z、音高波动 pitch_span_hz、建议标签 suggested_emotion）真实判断角色语气变化，不要消极全部标成 neutral。若声学与语义均确实平淡，再保持 neutral。
 4. 只有明确写在原文里的非语言事件（如 [laughs] / （叹气））才可标记 keep_original=true；Yes / Go / 你好 / はい / ha ha ha 等语言性短句仍须翻译，不得仅凭LLM判断保留原声。
 5. 每条台词参考 lines 中该 id 的 min_units / max_units 与 unit 预算；max_units 只是配音预算，不能牺牲语义完整性。
 6. 术语和专名必须按 glossary 的固定译法，不得同义改写；中文配音中的英文缩写、单字母和专名要写成可朗读形式（必要时在 glossary 中给出读法）。

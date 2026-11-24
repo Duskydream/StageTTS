@@ -1,5 +1,7 @@
 # OpenMOSS main parser: pinned runtime and installation record
 
+> Current update: application input limit is now 5400 seconds (90 minutes), output token budget 65536, processor context 131072. Earlier 60-second restrictions below are historical validation scope, not the current cap. Long-audio memory, speed and quality are unverified on 8GB hardware.
+
 This document supersedes the earlier draft below it titled “MOSS selected as the new main parser; installation/inference pending.” MOSS is the production parser. WhisperX/pyannote remain isolated legacy/experimental code and are not automatic fallbacks.
 
 ## Pinned model and runtime
@@ -39,8 +41,8 @@ MOSS_REVISION=10304d926740cf5a5cee05a268086e3265197910
 MOSS_TORCH_VERSION=2.8.0+cu128
 MOSS_TRANSFORMERS_VERSION=5.6.0
 MOSS_CUSTOM_CODE_APPROVED=1
-MOSS_MAX_AUDIO_SECONDS=60
-MOSS_MAX_NEW_TOKENS=4096
+MOSS_MAX_AUDIO_SECONDS=5400
+MOSS_MAX_NEW_TOKENS=65536
 BANQUET_ROOT=F:/Download/StageTTS/banquet/bandit-v2
 BANQUET_CHECKPOINT=F:/Download/StageTTS/banquet/banquet-split.ckpt
 ```
@@ -51,9 +53,9 @@ After changing parser configuration, restart the backend; it loads environment c
 
 ## Duration: model capability versus application budget
 
-The upstream model card claims single-pass inputs up to 90 minutes. **StageTTS does not currently support that duration.** The application is configured to reject inputs above 60 seconds (apart from a separately logged ≤0.05-second extracted-wave tail tolerance). Real GPU measurements cover Japanese/English at 10, 30 and 60 seconds on an RTX 5060 Laptop 8GB; at 60 seconds peak allocated CUDA memory was 1.942 GiB and reserved memory 1.965 GiB. These are small representative runs, not evidence that a 90-minute run fits, completes in reasonable time, or yields a complete transcript.
+The upstream model card claims single-pass inputs up to 90 minutes. **StageTTS now permits a 5400-second input budget.** Earlier versions rejected inputs above 60 seconds (apart from a separately logged ≤0.05-second extracted-wave tail tolerance). Real GPU measurements cover Japanese/English at 10, 30 and 60 seconds on an RTX 5060 Laptop 8GB; at 60 seconds peak allocated CUDA memory was 1.942 GiB and reserved memory 1.965 GiB. These are small representative runs, not evidence that a 90-minute run fits, completes in reasonable time, or yields a complete transcript.
 
-`MOSS_MAX_AUDIO_SECONDS` is an application fail-fast budget, not the model's intrinsic limit. Raising it requires staged, measured long-audio validation, increasing output-token budget if required, memory/time measurements and transcript-completeness checks. Long-video segmentation and cross-window speaker-identity reconciliation are not implemented. Do not split windows and assume `S01` denotes the same speaker across windows.
+`MOSS_MAX_AUDIO_SECONDS` is an application fail-fast budget, not the model's intrinsic limit. Long-audio deployment still requires staged, measured validation, increasing output-token budget if required, memory/time measurements and transcript-completeness checks. Long-video segmentation and cross-window speaker-identity reconciliation are not implemented. Do not split windows and assume `S01` denotes the same speaker across windows.
 
 ## Output and known model boundaries
 

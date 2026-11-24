@@ -22,6 +22,13 @@ from pydantic import BaseModel, Field
 from backend.services.llm_settings import (
     LLMSettingsResponse, LLMSettingsUpdate, get_llm_snapshot, save_llm_settings,
 )
+from backend.services.training_settings import (
+    InferenceModelUpdate, TrainingSettings, TrainingSettingsResponse,
+    apply_inference_base_model, training_settings_response, save_training_settings,
+)
+from backend.services.voice_presets import (
+    create_voice_preset, delete_voice_preset, list_voice_presets,
+)
 from backend import config
 from backend.agent.orchestrator import run_agent_chat
 from backend.agent.tools import (
@@ -51,9 +58,21 @@ from backend.schemas import (
     TranslationRequest,
     TranslationResponse,
     UploadResponse,
+    VoicePreset,
+    VoicePresetCreateRequest,
+    VoicePresetDeleteResponse,
+    VoicePresetListResponse,
 )
 from backend.services.media_mixer import check_ffmpeg_available
+from backend.services.emotion_routing import build_character_emotion_refs
+from backend.services.gsv_finetune import (
+    FinetuneJobStatus,
+    FinetuneStartRequest,
+    get_finetune_status,
+    start_finetune_job,
+)
 from backend.services.references import automatic_reference, store_reference_audio
+from backend.services.text_normalization import normalize_tts_lang
 from backend.services.task_runner import (
     GpuBusyError,
     ParseWorkerError,
@@ -183,6 +202,36 @@ def _find_input_media(project_id: str, script: ProjectScript | None) -> Path:
 # ---------------------------------------------------------------------------
 
 
+@app.get("/api/settings/training", response_model=TrainingSettingsResponse)
+def get_training_settings() -> TrainingSettingsResponse:
+    return training_settings_response()
+
+
+@app.put("/api/settings/training", response_model=TrainingSettingsResponse)
+def put_training_settings(req: TrainingSettings) -> TrainingSettingsResponse:
+    return save_training_settings(req)
+
+
+@app.put("/api/settings/training/inference", response_model=TrainingSettingsResponse)
+def put_inference_base_model(req: InferenceModelUpdate) -> TrainingSettingsResponse:
+    return apply_inference_base_model(req.base_model)
+
+
+@app.get("/api/voice-presets", response_model=VoicePresetListResponse)
+def get_voice_presets() -> VoicePresetListResponse:
+    return VoicePresetListResponse(presets=list_voice_presets())
+
+
+@app.post("/api/voice-presets", response_model=VoicePreset)
+def post_voice_preset(req: VoicePresetCreateRequest) -> VoicePreset:
+    return create_voice_preset(req)
+
+
+@app.delete("/api/voice-presets/{preset_id}", response_model=VoicePresetDeleteResponse)
+def remove_voice_preset(preset_id: str) -> VoicePresetDeleteResponse:
+    return VoicePresetDeleteResponse(deleted_id=delete_voice_preset(preset_id))
+
+
 @app.get("/api/settings/llm", response_model=LLMSettingsResponse)
 def read_llm_settings() -> LLMSettingsResponse:
     return get_llm_snapshot().public()
@@ -281,10 +330,19 @@ def upload_project_reference(project_id: str, file: UploadFile = File(...)) -> d
     return {"wav": store_reference_audio(safe_id, file.file)}
 
 
+class AutoEmotionRefsRequest(BaseModel):
+    overwrite: bool = False
+
+
+class AutoEmotionRefsResponse(BaseModel):
+    script: ProjectScript
+    populated_emotions: List[str] = Field(default_factory=list)
+
+
 @app.post("/api/projects/{project_id}/characters/{speaker}/reference-preview", response_model=ReferencePreview)
 def preview_automatic_reference(project_id: str, speaker: str) -> ReferencePreview:
     safe_id = _validate_project_id(project_id)
-    with project_task_guard(safe_id):
+    with project_task_guard(safe_id), gpu_task_guard():
         script = load_project_script(safe_id)
         if speaker not in script.characters:
             raise FileNotFoundError("角色不存在")
@@ -292,6 +350,47 @@ def preview_automatic_reference(project_id: str, speaker: str) -> ReferencePrevi
         if ref is None:
             raise ValueError("找不到 3–10 秒的同角色参考音。请确认台词原文、时间范围、说话人和源语种，或上传参考音")
         return ref
+
+
+@app.post("/api/projects/{project_id}/characters/{speaker}/emotion-refs", response_model=AutoEmotionRefsResponse)
+def auto_match_character_emotion_refs(
+    project_id: str,
+    speaker: str,
+    req: AutoEmotionRefsRequest | None = None,
+) -> AutoEmotionRefsResponse:
+    safe_id = _validate_project_id(project_id)
+    with project_task_guard(safe_id), gpu_task_guard():
+        script = load_project_script(safe_id)
+        if speaker not in script.characters:
+            raise FileNotFoundError("角色不存在")
+        if speaker == "UNKNOWN":
+            raise ValueError("请先在剧本或角色面板确认说话人，再自动匹配多情绪参考音")
+        if not normalize_tts_lang(script.source_lang, default=""):
+            raise ValueError("请先在翻译设置中确认原声语种，再自动匹配多情绪参考音")
+        if not script.media.vocals_wav:
+            raise ValueError("项目缺少源人声音轨，无法自动匹配参考音")
+        overwrite = bool(req.overwrite) if req is not None else False
+        populated = build_character_emotion_refs(script, speaker=speaker, overwrite=overwrite)
+        emotions = populated.get(speaker, [])
+        if emotions:
+            save_project_script(script)
+        return AutoEmotionRefsResponse(script=script, populated_emotions=emotions)
+
+
+@app.post("/api/projects/{project_id}/characters/{speaker}/finetune", response_model=FinetuneJobStatus)
+def start_character_finetune(
+    project_id: str,
+    speaker: str,
+    req: FinetuneStartRequest | None = None,
+) -> FinetuneJobStatus:
+    safe_id = _validate_project_id(project_id)
+    return start_finetune_job(safe_id, speaker, req or FinetuneStartRequest())
+
+
+@app.get("/api/projects/{project_id}/finetune/status", response_model=FinetuneJobStatus)
+def read_project_finetune_status(project_id: str, speaker: str | None = None) -> FinetuneJobStatus:
+    safe_id = _validate_project_id(project_id)
+    return get_finetune_status(safe_id, speaker=speaker)
 
 
 @app.post("/api/projects/{project_id}/translate", response_model=TranslationResponse)

@@ -8,7 +8,6 @@ import {
   Play,
   Save,
   Settings,
-  Sparkles,
   Workflow,
 } from "lucide-react";
 import type React from "react";
@@ -16,9 +15,9 @@ import { useState } from "react";
 import { ApiError, type GpuDevice, fetchGpuStatus, renderVideo } from "../../services/api";
 import { useProjectStore } from "../../store/useProjectStore";
 import { useWorkflowStore } from "../../store/useWorkflowStore";
+import { type WorkspacePreset, pipelineNodeHint, pipelineStartForNode } from "../../types/workflow";
 import { SettingsPage } from "../SettingsPage";
 import { PipelineRunControls } from "../workflow/PipelineRunControls";
-import { pipelineStartForNode, pipelineNodeHint, type WorkspacePreset } from "../../types/workflow";
 
 const PRESET_OPTIONS: Array<{
   id: WorkspacePreset;
@@ -35,19 +34,14 @@ const PRESET_OPTIONS: Array<{
     label: "节点流",
     icon: <Workflow className="h-3.5 w-3.5" strokeWidth={1.5} />,
   },
-  {
-    id: "stage",
-    label: "舞台",
-    icon: <Sparkles className="h-3.5 w-3.5" strokeWidth={1.5} />,
-  },
 ];
 
-function formatGpuMemory(gpu: GpuDevice): string {
-  return `${(gpu.used_mib / 1024).toFixed(1)}/${(gpu.total_mib / 1024).toFixed(1)} GiB`;
+function formatGpuCompact(gpu: GpuDevice): string {
+  return `${(gpu.used_mib / 1024).toFixed(1)}/${(gpu.total_mib / 1024).toFixed(1)}G`;
 }
 
 /**
- * 紧凑 36px 顶部主控栏（#222222 哑光灰底、无外框暗槽分段器、极淡无框信息标签）。
+ * 紧凑 36px Premiere 风格顶部主控栏（去文字冗余，图标 + 关键计数优先）。
  */
 export const TopMenuBar: React.FC = () => {
   const script = useProjectStore((s) => s.script);
@@ -79,11 +73,10 @@ export const TopMenuBar: React.FC = () => {
     retry: false,
   });
   const gpus = gpuData?.devices ?? [];
-
   const primaryGpu = gpus[0];
   const gpuTitle = gpus.length
-    ? gpus.map((gpu) => `${gpu.name} · ${formatGpuMemory(gpu)}`).join("\n")
-    : "无法读取后端机器的 NVIDIA 显存数据";
+    ? gpus.map((gpu) => `${gpu.name} · ${formatGpuCompact(gpu)}`).join("\n")
+    : "显存监控不可用";
 
   const statusColor =
     backendStatus === "online"
@@ -94,10 +87,10 @@ export const TopMenuBar: React.FC = () => {
 
   const statusTitle =
     backendStatus === "online"
-      ? "FastAPI 后端已连接"
+      ? "后端已连接"
       : backendStatus === "connecting"
-        ? "正在检测后端连接..."
-        : "离线演示模式（未连接后端）";
+        ? "连接中..."
+        : "离线模式";
 
   const pendingCount = script
     ? script.segments.filter((seg) => !seg.keep_original && seg.status !== "ready").length
@@ -107,7 +100,7 @@ export const TopMenuBar: React.FC = () => {
     if (!script || isSynthesizing) {
       return;
     }
-    setActionToast("正在按需启动 GPT-SoVITS 并配音...");
+    setActionToast("配音中...");
     const ids =
       pendingCount === 0
         ? script.segments.filter((seg) => !seg.keep_original).map((seg) => seg.id)
@@ -147,14 +140,17 @@ export const TopMenuBar: React.FC = () => {
           return;
         }
         if (afterSave.error || afterSave.isDirty) {
-          const msg = afterSave.error ?? "请先保存当前修改后再导出";
+          const msg = afterSave.error ?? "请先保存修改";
           setActionToast(msg);
           appendLog("env_backend", msg, "error");
           window.setTimeout(() => setActionToast(null), 3000);
           return;
         }
       }
-      const res = await renderVideo(script.project_id, pipelineConfig.burnWatermark);
+      const res = await renderVideo(script.project_id, {
+        burn_watermark: pipelineConfig.burnWatermark,
+        burn_subtitles: pipelineConfig.burnSubtitles,
+      });
       useProjectStore.setState((state) =>
         state.script?.project_id === res.project_id
           ? {
@@ -165,7 +161,7 @@ export const TopMenuBar: React.FC = () => {
             }
           : state,
       );
-      setActionToast("已导出成片");
+      setActionToast("已导出");
       appendLog("env_backend", `导出成功: ${res.output_video}`, "success");
     } catch (err) {
       const isStub =
@@ -189,8 +185,7 @@ export const TopMenuBar: React.FC = () => {
   };
 
   return (
-    <header className="flex h-9 shrink-0 items-center justify-between bg-[#222222] px-3.5 text-[12px]">
-      {/* 左侧：Logo · 状态点 · 无边框项目标签 · 柔和次操作保存按钮 */}
+    <header className="flex h-9 shrink-0 items-center justify-between bg-[#222222] px-3 text-[12px]">
       <div className="flex items-center gap-2">
         <div className="flex items-center gap-1.5 text-[13px] font-medium text-primary">
           <Clapperboard className="h-4 w-4 text-secondary" strokeWidth={1.5} />
@@ -199,29 +194,28 @@ export const TopMenuBar: React.FC = () => {
 
         <span title={statusTitle} className={`h-1.5 w-1.5 shrink-0 rounded-full ${statusColor}`} />
 
-        <span className="flex h-6 items-center rounded-[4px] bg-white/[0.04] px-2 font-mono tabular-nums text-[11px] text-secondary">
-          {script ? script.project_id : "未打开项目"}
-        </span>
-
         {script && (
-          <button
-            type="button"
-            disabled={isLoading}
-            onClick={() => void saveProjectScript()}
-            title="保存剧本修改"
-            className="flex h-7 items-center gap-1.5 rounded-[4px] border border-white/[0.08] bg-[#2C2C2C] px-2.5 py-1 text-[12px] text-primary transition-colors hover:bg-[#363636] disabled:opacity-50"
-          >
-            {isDirty ? (
-              <span className="h-1.5 w-1.5 rounded-full bg-status-warning" />
-            ) : (
+          <>
+            <span className="flex h-6 items-center rounded-[4px] bg-white/[0.04] px-2 font-mono tabular-nums text-[11px] text-secondary">
+              {script.project_id}
+            </span>
+            <button
+              type="button"
+              disabled={isLoading}
+              onClick={() => void saveProjectScript()}
+              title="保存 (Ctrl+S)"
+              aria-label="保存"
+              className="relative flex h-7 w-7 items-center justify-center rounded-[4px] border border-white/[0.08] bg-[#2C2C2C] text-primary transition-colors hover:bg-[#363636] disabled:opacity-50"
+            >
               <Save className="h-3.5 w-3.5 text-secondary" strokeWidth={1.5} />
-            )}
-            <span>{isDirty ? "保存*" : "保存"}</span>
-          </button>
+              {isDirty && (
+                <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-status-warning" />
+              )}
+            </button>
+          </>
         )}
       </div>
 
-      {/* 中部：无外框暗槽分段控制器（槽底 #181818，选中项 #333333 白字） */}
       <nav
         aria-label="工作区模式"
         className="flex items-center gap-0.5 rounded-[4px] bg-[#181818] p-0.5"
@@ -244,48 +238,44 @@ export const TopMenuBar: React.FC = () => {
         })}
       </nav>
 
-      {/* 右侧：无外框极淡标签（bg-white/[0.04]） · 实心钢蓝主按钮 */}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1.5">
         {actionToast && (
-          <span className="flex h-6 items-center rounded-[4px] bg-white/[0.06] px-2 text-[11px] text-primary">
+          <span className="flex h-6 max-w-48 truncate items-center rounded-[4px] bg-white/[0.06] px-2 text-[11px] text-primary">
             {actionToast}
-          </span>
-        )}
-
-        {script && (
-          <span className="hidden h-6 items-center whitespace-nowrap rounded-[4px] bg-white/[0.04] px-2 text-[11px] text-secondary md:flex">
-            AI 合成语音
           </span>
         )}
 
         <div
           title={gpuTitle}
-          className="hidden h-7 items-center gap-1.5 whitespace-nowrap rounded-[4px] bg-white/[0.04] px-2 font-mono tabular-nums text-[11px] text-secondary sm:flex"
+          className="hidden h-7 items-center gap-1 whitespace-nowrap rounded-[4px] bg-white/[0.04] px-2 font-mono tabular-nums text-[11px] text-secondary sm:flex"
         >
           <Cpu className="h-3.5 w-3.5 text-secondary" strokeWidth={1.5} />
-          <span className="max-w-64 truncate">
-            {primaryGpu
-              ? `${primaryGpu.name.replace(/^NVIDIA GeForce /, "")} · ${formatGpuMemory(primaryGpu)}${gpus.length > 1 ? ` +${gpus.length - 1}` : ""}`
-              : "显存不可用"}
-          </span>
+          <span>{primaryGpu ? formatGpuCompact(primaryGpu) : "--"}</span>
         </div>
 
-        <button type="button" onClick={() => setSettingsOpen(true)} title="翻译模型与接口设置" className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-[4px] px-2 text-secondary hover:bg-white/5 hover:text-primary">
+        <button
+          type="button"
+          onClick={() => setSettingsOpen(true)}
+          title="设置"
+          aria-label="设置"
+          className="flex h-7 w-7 items-center justify-center rounded-[4px] text-secondary hover:bg-white/5 hover:text-primary"
+        >
           <Settings className="h-3.5 w-3.5" strokeWidth={1.5} />
-          <span>设置</span>
         </button>
         {settingsOpen && <SettingsPage onClose={() => setSettingsOpen(false)} />}
+
         <PipelineRunControls />
+
         {workspacePreset === "workflow" ? (
           <button
             type="button"
             disabled={isPipelineRunning || !startStep}
-            title={startStep ? `从「${selectedTitle}」开始运行后续管线` : pipelineNodeHint(selectedNodeId)}
+            title={startStep ? `从「${selectedTitle}」运行` : pipelineNodeHint(selectedNodeId)}
             onClick={() => void runPipeline({ parseOnly: false })}
-            className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-[4px] bg-[#3A6EA5] px-3 py-1 text-[12px] font-medium text-[#FFFFFF] transition-colors hover:bg-[#467DB8] disabled:opacity-50"
+            className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-[4px] bg-[#3A6EA5] px-3 text-[12px] font-medium text-[#FFFFFF] transition-colors hover:bg-[#467DB8] disabled:opacity-50"
           >
             <Play className="h-3.5 w-3.5" strokeWidth={1.5} />
-            <span>{isPipelineRunning ? "运行中..." : startStep ? `从${selectedTitle}运行` : "请先选择节点"}</span>
+            <span>{isPipelineRunning ? "运行中" : startStep ? "运行" : "选节点"}</span>
           </button>
         ) : (
           script && (
@@ -295,16 +285,12 @@ export const TopMenuBar: React.FC = () => {
                   type="button"
                   disabled={isSynthesizing || isLoading || isPipelineRunning}
                   onClick={() => void handleBatchSynthesize()}
-                  title="自动按需启动 GPT-SoVITS 并批量合成所有待配音片段"
-                  className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-[4px] border border-white/[0.1] bg-[#2C2C2C] px-3 py-1 text-[12px] font-medium text-primary transition-colors hover:bg-[#363636] disabled:opacity-50"
+                  title="批量合成待配音片段"
+                  className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-[4px] border border-white/[0.1] bg-[#2C2C2C] px-2.5 text-[12px] font-medium text-primary transition-colors hover:bg-[#363636] disabled:opacity-50"
                 >
                   <Mic className="h-3.5 w-3.5 text-secondary" strokeWidth={1.5} />
                   <span>
-                    {isSynthesizing
-                      ? "配音中..."
-                      : pendingCount > 0
-                        ? `全部配音 (${pendingCount})`
-                        : "重新配音"}
+                    {isSynthesizing ? "配音中" : pendingCount > 0 ? `配音 (${pendingCount})` : "配音"}
                   </span>
                 </button>
               )}
@@ -312,10 +298,11 @@ export const TopMenuBar: React.FC = () => {
                 type="button"
                 disabled={isExporting || isSynthesizing || isLoading || isPipelineRunning}
                 onClick={() => void handleExport()}
-                className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-[4px] bg-[#3A6EA5] px-3 py-1 text-[12px] font-medium text-[#FFFFFF] transition-colors hover:bg-[#467DB8] disabled:opacity-50"
+                title="导出成片"
+                className="flex h-7 items-center gap-1.5 whitespace-nowrap rounded-[4px] bg-[#3A6EA5] px-2.5 text-[12px] font-medium text-[#FFFFFF] transition-colors hover:bg-[#467DB8] disabled:opacity-50"
               >
                 <Download className="h-3.5 w-3.5" strokeWidth={1.5} />
-                <span>{isExporting ? "导出中..." : "导出成片"}</span>
+                <span>{isExporting ? "导出中" : "导出"}</span>
               </button>
             </>
           )

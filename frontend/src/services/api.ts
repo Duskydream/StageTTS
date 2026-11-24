@@ -2,7 +2,10 @@ import createClient from "openapi-fetch";
 import type { components, paths } from "../types/api.generated";
 import type {
   AgentChatResponse,
+  AutoEmotionRefsResponse,
   ExportDirsResponse,
+  FinetuneJobStatus,
+  FinetuneStartRequest,
   GpuDevice,
   GpuStatusResponse,
   HealthResponse,
@@ -64,6 +67,22 @@ async function unwrap<T>(
   }
 
   return result.data;
+}
+
+export type TrainingSettingsResponse = components["schemas"]["TrainingSettingsResponse"];
+export type TrainingSettings = components["schemas"]["TrainingSettings"];
+export function fetchTrainingSettings(): Promise<TrainingSettingsResponse> {
+  return unwrap(apiClient.GET("/api/settings/training", { cache: "no-store" }));
+}
+export function saveTrainingSettings(settings: TrainingSettings): Promise<TrainingSettingsResponse> {
+  return unwrap(apiClient.PUT("/api/settings/training", { body: settings }));
+}
+export function applyInferenceBaseModel(
+  baseModel: TrainingSettings["base_model"],
+): Promise<TrainingSettingsResponse> {
+  return unwrap(
+    apiClient.PUT("/api/settings/training/inference", { body: { base_model: baseModel } }),
+  );
 }
 
 export type LLMSettings = components["schemas"]["LLMSettingsResponse"];
@@ -143,6 +162,47 @@ export function previewAutomaticReference(
   return unwrap(
     apiClient.POST("/api/projects/{project_id}/characters/{speaker}/reference-preview", {
       params: { path: { project_id: projectId, speaker } },
+    }),
+  );
+}
+
+export function autoMatchEmotionRefs(
+  projectId: string,
+  speaker: string,
+  overwrite = false,
+): Promise<AutoEmotionRefsResponse> {
+  return unwrap(
+    apiClient.POST("/api/projects/{project_id}/characters/{speaker}/emotion-refs", {
+      params: { path: { project_id: projectId, speaker } },
+      body: { overwrite },
+    }),
+  );
+}
+
+export function startCharacterFinetune(
+  projectId: string,
+  speaker: string,
+  payload: FinetuneStartRequest = {},
+): Promise<FinetuneJobStatus> {
+  return unwrap(
+    apiClient.POST("/api/projects/{project_id}/characters/{speaker}/finetune", {
+      params: { path: { project_id: projectId, speaker } },
+      body: payload,
+    }),
+  );
+}
+
+export function fetchFinetuneStatus(
+  projectId: string,
+  speaker?: string,
+): Promise<FinetuneJobStatus> {
+  return unwrap(
+    apiClient.GET("/api/projects/{project_id}/finetune/status", {
+      params: {
+        path: { project_id: projectId },
+        query: speaker ? { speaker } : undefined,
+      },
+      cache: "no-store",
     }),
   );
 }

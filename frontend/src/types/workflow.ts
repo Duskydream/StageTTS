@@ -4,15 +4,15 @@
 
 import type { SubtitleBurnMode } from "./script";
 
-export type WorkspacePreset = "editing" | "workflow" | "stage";
+export type WorkspacePreset = "editing" | "workflow";
 
-export type CenterViewTab = "video" | "stage" | "graph";
+export type CenterViewTab = "video" | "graph";
 
-export type RightPanelTab = "inspector" | "agent" | "node" | "logs";
+export type RightPanelTab = "inspector" | "agent" | "logs";
 
 export type LeftDrawerTab = "none" | "characters" | "media";
 
-export type EnvBadge = "env_parse" | "env_tts" | "env_backend" | "frontend";
+export type EnvBadge = "env_parse" | "env_tts" | "env_backend";
 
 export type NodeCategory = "input" | "parse" | "hub" | "synthesis" | "output";
 
@@ -51,9 +51,8 @@ export function pipelineStartForNode(nodeId: string | null): PipelineStartStep |
 }
 
 export function pipelineNodeHint(nodeId: string | null): string {
-  if (nodeId === "whisperx") return "MOSS 识别节点不能单独启动；请从音轨分离节点运行完整解析，或选择翻译节点处理已有对白。";
-  if (nodeId === "virtual_stage_out") return "舞台节点请使用右侧「进入虚拟舞台」。";
-  return "请先在画布中选中一个可运行节点。";
+  if (nodeId === "whisperx") return "从音轨分离或翻译节点启动";
+  return "点击节点选择起点";
 }
 
 export interface PipelineConfig {

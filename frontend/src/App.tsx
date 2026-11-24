@@ -1,17 +1,14 @@
-import { Bot, Sliders, Terminal, Wrench } from "lucide-react";
 import type React from "react";
 import { useEffect } from "react";
-import { AgentChat } from "./components/AgentChat";
 import { Inspector } from "./components/Inspector";
 import { TimelinePR } from "./components/TimelinePR";
 import { VideoPreview } from "./components/VideoPreview";
-import { VirtualStage } from "./components/VirtualStage";
 import { LeftIconRail } from "./components/layout/LeftIconRail";
 import { ResizableSplit } from "./components/layout/ResizableSplit";
 import { TopMenuBar } from "./components/layout/TopMenuBar";
 import { WelcomeCanvas } from "./components/layout/WelcomeCanvas";
 import { AssetBinPanel } from "./components/panels/AssetBinPanel";
-import { NodeInspectorPanel, PipelineLogsPanel } from "./components/panels/NodeInspectorPanel";
+import { PipelineLogsPanel } from "./components/panels/NodeInspectorPanel";
 import { PipelineGraph } from "./components/workflow/PipelineGraph";
 import { useProjectStore } from "./store/useProjectStore";
 import { useWorkflowStore } from "./store/useWorkflowStore";
@@ -24,8 +21,6 @@ export const App: React.FC = () => {
   const setIsPlaying = useProjectStore((s) => s.setIsPlaying);
 
   const workspacePreset = useWorkflowStore((s) => s.workspacePreset);
-  const rightTab = useWorkflowStore((s) => s.rightTab);
-  const setRightTab = useWorkflowStore((s) => s.setRightTab);
 
   // 启动时仅探活后端与拉取项目列表，绝不自动载入样例
   useEffect(() => {
@@ -117,97 +112,17 @@ export const App: React.FC = () => {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [setIsPlaying, stepSegment]);
 
-  const renderWorkflowRightPanel = () => {
-    const activeTab = rightTab === "logs" ? "logs" : "node";
-    return (
-      <div className="flex h-full flex-col bg-[#222222]">
-        <div className="shrink-0 border-b border-white/[0.06] bg-[#222222] px-3 py-1.5">
-          <div className="grid h-7 grid-cols-2 gap-0.5 rounded-[4px] bg-[#181818] p-0.5 text-[12px]">
-            <button
-              type="button"
-              onClick={() => setRightTab("node")}
-              className={`flex items-center justify-center gap-1.5 rounded-[3px] font-medium transition-colors ${
-                activeTab === "node"
-                  ? "bg-[#333333] text-[#FFFFFF]"
-                  : "text-secondary hover:text-primary"
-              }`}
-            >
-              <Wrench className="h-3.5 w-3.5" strokeWidth={1.5} />
-              <span>节点参数</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setRightTab("logs")}
-              className={`flex items-center justify-center gap-1.5 rounded-[3px] font-medium transition-colors ${
-                activeTab === "logs"
-                  ? "bg-[#333333] text-[#FFFFFF]"
-                  : "text-secondary hover:text-primary"
-              }`}
-            >
-              <Terminal className="h-3.5 w-3.5" strokeWidth={1.5} />
-              <span>运行日志</span>
-            </button>
-          </div>
-        </div>
-
-        <div className="min-h-0 flex-1">
-          {activeTab === "logs" ? <PipelineLogsPanel /> : <NodeInspectorPanel />}
-        </div>
-      </div>
-    );
-  };
-
-  const renderEditingRightPanel = () => {
-    const activeTab = rightTab === "agent" ? "agent" : "inspector";
-    return (
-      <div className="flex h-full flex-col bg-[#222222]">
-        <div className="shrink-0 border-b border-white/[0.06] bg-[#222222] px-3 py-1.5">
-          <div className="grid h-7 grid-cols-2 gap-0.5 rounded-[4px] bg-[#181818] p-0.5 text-[12px]">
-            <button
-              type="button"
-              onClick={() => setRightTab("inspector")}
-              className={`flex items-center justify-center gap-1.5 rounded-[3px] font-medium transition-colors ${
-                activeTab === "inspector"
-                  ? "bg-[#333333] text-[#FFFFFF]"
-                  : "text-secondary hover:text-primary"
-              }`}
-            >
-              <Sliders className="h-3.5 w-3.5" strokeWidth={1.5} />
-              <span>精修</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setRightTab("agent")}
-              className={`flex items-center justify-center gap-1.5 rounded-[3px] font-medium transition-colors ${
-                activeTab === "agent"
-                  ? "bg-[#333333] text-[#FFFFFF]"
-                  : "text-secondary hover:text-primary"
-              }`}
-            >
-              <Bot className="h-3.5 w-3.5" strokeWidth={1.5} />
-              <span>AI 助手</span>
-            </button>
-          </div>
-        </div>
-
-        <div className="min-h-0 flex-1">
-          {activeTab === "agent" ? <AgentChat /> : <Inspector />}
-        </div>
-      </div>
-    );
-  };
-
   const renderMainBody = () => {
     if (workspacePreset === "workflow") {
       return (
         <ResizableSplit
           direction="horizontal"
-          initialSize={70}
+          initialSize={76}
           minSize={55}
-          maxSize={84}
+          maxSize={88}
           className="h-full flex-1"
           first={<PipelineGraph />}
-          second={renderWorkflowRightPanel()}
+          second={<PipelineLogsPanel />}
         />
       );
     }
@@ -235,8 +150,8 @@ export const App: React.FC = () => {
                 minSize={45}
                 maxSize={78}
                 className="h-full"
-                first={workspacePreset === "stage" ? <VirtualStage /> : <VideoPreview />}
-                second={renderEditingRightPanel()}
+                first={<VideoPreview />}
+                second={<Inspector />}
               />
             }
             second={<TimelinePR />}

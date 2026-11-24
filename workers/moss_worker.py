@@ -2,7 +2,7 @@
 
 Input JSON version=1.0, model={local_path,revision,transformers_version,torch_version,
 custom_code_approved:true}, source={id,kind:raw|dialogue,audio_path}, device=cuda:0,
-max_audio_seconds<=60, max_new_tokens<=4096. PCM16 mono 16k WAV is explicit.
+max_audio_seconds<=5400, max_new_tokens<=65536. PCM16 mono 16k WAV is explicit.
 Output retains raw tagged generation and segment timestamps; no invented word times,
 probabilities or stable cross-window speaker identities. Run only in prepared env.
 """
@@ -20,6 +20,11 @@ import sys
 import time
 import wave
 from pathlib import Path
+
+# Direct --input/--output launches must resolve sibling worker helpers too.
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 MODEL_ID = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 REVISION = "10304d926740cf5a5cee05a268086e3265197910"
@@ -145,12 +150,12 @@ def validate_request(request: dict, *, model_only: bool = False) -> tuple[Path, 
             raise ValueError(f"{package} version differs from request")
     if request.get("device", "cuda:0") not in {"cuda:0", "cpu"}:
         raise ValueError("device must be cuda:0 or explicitly cpu")
-    seconds_limit = float(request.get("max_audio_seconds", 30))
-    if not 0 < seconds_limit <= 60:
-        raise ValueError("validated whole-recording experiment permits max_audio_seconds <=60 only")
+    seconds_limit = float(request.get("max_audio_seconds", 5400))
+    if not 0 < seconds_limit <= 5400:
+        raise ValueError("max_audio_seconds must be in (0, 5400] (90 minutes)")
     tokens = request.get("max_new_tokens", 1024)
-    if isinstance(tokens, bool) or not isinstance(tokens, int) or not 1 <= tokens <= 4096:
-        raise ValueError("max_new_tokens must be 1..4096")
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or not 1 <= tokens <= 65536:
+        raise ValueError("max_new_tokens must be 1..65536")
     if model_only:
         return root, audio, 0.0, manifest
     with wave.open(str(audio), "rb") as stream:
@@ -162,13 +167,11 @@ def validate_request(request: dict, *, model_only: bool = False) -> tuple[Path, 
     return root, audio, duration, manifest
 
 
-def _infer(root: Path, audio: Path, request: dict) -> dict:
+def _load_model_and_processor(root: Path, device: str):
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    import numpy as np
     import torch
     from transformers import AutoModelForCausalLM, AutoProcessor
-    device = request.get("device", "cuda:0")
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable; no silent CPU fallback")
     dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
@@ -177,14 +180,37 @@ def _infer(root: Path, audio: Path, request: dict) -> dict:
     model = AutoModelForCausalLM.from_pretrained(str(root), trust_remote_code=True, local_files_only=True,
                                                 dtype=dtype, attn_implementation="sdpa").to(device).eval()
     processor = AutoProcessor.from_pretrained(str(root), trust_remote_code=True, local_files_only=True)
+    # The official processor emits 30-second encoder chunks. Encode these
+    # sequentially while retaining one full-recording decoder/speaker scope.
+    from transformers.modeling_outputs import BaseModelOutput
+    encoder = model.model.whisper_encoder
+    original_forward = encoder.forward
+    def sequential_encoder(input_features, *args, **kwargs):
+        if input_features.shape[0] <= 1:
+            return original_forward(input_features, *args, **kwargs)
+        outputs = [original_forward(chunk, *args, **kwargs).last_hidden_state
+                   for chunk in input_features.split(1, dim=0)]
+        return BaseModelOutput(last_hidden_state=torch.cat(outputs, dim=0))
+    encoder.forward = sequential_encoder
+    return model, processor, dtype
+
+
+def _infer_loaded(model, processor, device: str, dtype, audio: Path, max_new_tokens: int) -> dict:
+    import numpy as np
+    import torch
+    from workers.bounded_attention import bounded_sdpa
     with wave.open(str(audio), "rb") as stream:
         waveform = np.frombuffer(stream.readframes(stream.getnframes()), dtype="<i2").astype(np.float32) / 32768
     messages = [{"role": "user", "content": [{"type": "audio", "audio": str(audio)}, {"type": "text", "text": PROMPT}]}]
     template = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=template, audio=[waveform], return_tensors="pt", max_length=4096).to(device)
+    inputs = processor(text=template, audio=[waveform], return_tensors="pt", max_length=131072).to(device)
     prompt_length = int(inputs["attention_mask"][0].sum().item())
-    with torch.inference_mode():
-        generated = model.generate(**inputs, max_new_tokens=request.get("max_new_tokens", 1024), do_sample=False,
+    context_limit = int(model.config.text_config.max_position_embeddings)
+    output_budget = min(max_new_tokens, context_limit - prompt_length)
+    if output_budget < 1:
+        raise ValueError("MOSS prompt/audio fills model context; shorten audio")
+    with torch.inference_mode(), bounded_sdpa():
+        generated = model.generate(**inputs, max_new_tokens=output_budget, do_sample=False,
                                    logits_to_keep=1)
     ids = generated[0][prompt_length:]
     text = processor.tokenizer.decode(ids, skip_special_tokens=True).strip()
@@ -195,11 +221,17 @@ def _infer(root: Path, audio: Path, request: dict) -> dict:
         eos_ids = [eos_ids] if eos_ids is not None else []
     ended_with_eos = bool(ids.numel() and int(ids[-1].item()) in eos_ids)
     return {"raw_text": text, "prompt_tokens": prompt_length, "generated_tokens": int(ids.numel()),
-            "generation_limit_reached": int(ids.numel()) >= request.get("max_new_tokens", 1024),
+            "generation_limit_reached": int(ids.numel()) >= output_budget,
             "ended_with_eos": ended_with_eos,
             "peak_allocated_bytes": torch.cuda.max_memory_allocated() if device.startswith("cuda") else None,
             "peak_reserved_bytes": torch.cuda.max_memory_reserved() if device.startswith("cuda") else None,
             "device": device, "dtype": str(dtype), "attention_backend": "sdpa"}
+
+
+def _infer(root: Path, audio: Path, request: dict) -> dict:
+    device = request.get("device", "cuda:0")
+    model, processor, dtype = _load_model_and_processor(root, device)
+    return _infer_loaded(model, processor, device, dtype, audio, request.get("max_new_tokens", 65536))
 
 
 def peak_rss_bytes() -> int | None:
@@ -256,18 +288,83 @@ def run_request(request: dict) -> dict:
             result["review_reasons"].append("generation_did_not_end_with_eos")
         result["status"] = "partial" if result["review_reasons"] else "ok"
         result["duration_seconds"] = duration
-        result["audio_budget_seconds"] = float(request.get("max_audio_seconds", 30))
+        result["audio_budget_seconds"] = float(request.get("max_audio_seconds", 5400))
         result["media_tail_tolerance_seconds"] = 0.05
         if duration > result["audio_budget_seconds"]:
             result["review_reasons"].append("source_wave_tail_within_explicit_0.05s_budget_tolerance")
             result["status"] = "partial"
         result["rtf"] = (time.perf_counter() - started) / duration
     except Exception as exc:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         result["status"] = "error"
         result["error"] = f"{type(exc).__name__}: {exc}"
     result["elapsed_seconds"] = round(time.perf_counter() - started, 6)
     result["peak_rss_bytes"] = peak_rss_bytes()
     return result
+
+
+def run_batch_request(request: dict) -> dict:
+    """Load MOSS once and transcribe multiple short clips in one worker process."""
+    sources = request.get("sources")
+    if not isinstance(sources, list) or not sources:
+        return {"version": "1.0", "stage": "moss_transcribe_diarize", "status": "not_run", "error": "sources must be a non-empty list", "results": []}
+    try:
+        root, _, _, _ = validate_request({**request, "source": sources[0]}, model_only=True)
+    except (OSError, ValueError, TypeError, KeyError, importlib.metadata.PackageNotFoundError, wave.Error) as exc:
+        return {"version": "1.0", "stage": "moss_transcribe_diarize", "status": "not_run", "error": str(exc), "results": []}
+
+    device = request.get("device", "cuda:0")
+    started = time.perf_counter()
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            model, processor, dtype = _load_model_and_processor(root, device)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return {"version": "1.0", "stage": "moss_transcribe_diarize", "status": "error", "error": f"{type(exc).__name__}: {exc}", "results": []}
+
+    results: list[dict] = []
+    max_seconds = float(request.get("max_audio_seconds", 10))
+    max_tokens = int(request.get("max_new_tokens", 1024))
+    for src in sources:
+        item = {"source": src, "status": "not_run", "segments": [], "review_reasons": [], "error": None}
+        try:
+            audio = Path(str(src.get("audio_path") or ""))
+            if not audio.is_absolute() or not audio.is_file():
+                raise ValueError("audio_path must be an existing absolute path")
+            with wave.open(str(audio), "rb") as stream:
+                if stream.getnchannels() != 1 or stream.getframerate() != 16000 or stream.getsampwidth() != 2 or stream.getcomptype() != "NONE":
+                    raise ValueError("explicit PCM16 mono 16k WAV required")
+                duration = stream.getnframes() / stream.getframerate()
+            if not 0 < duration <= max_seconds + 0.05:
+                raise ValueError("audio duration exceeds explicit budget")
+            with contextlib.redirect_stdout(sys.stderr):
+                generation = _infer_loaded(model, processor, device, dtype, audio, max_tokens)
+            item.update(generation)
+            item["segments"], item["review_reasons"] = parse_generation(
+                generation["raw_text"], duration, source_id=str(src.get("id") or "batch"),
+                window_id=str(src.get("window_id") or sha256(audio)),
+            )
+            if generation.get("generation_limit_reached"):
+                item["review_reasons"].append("generation_token_limit_reached_possible_truncation")
+            elif generation.get("ended_with_eos") is False:
+                item["review_reasons"].append("generation_did_not_end_with_eos")
+            item["status"] = "partial" if item["review_reasons"] else "ok"
+            item["duration_seconds"] = duration
+        except Exception as exc:
+            item["status"] = "error"
+            item["error"] = f"{type(exc).__name__}: {exc}"
+        results.append(item)
+
+    return {
+        "version": "1.0",
+        "stage": "moss_transcribe_diarize",
+        "status": "ok",
+        "device": device,
+        "elapsed_seconds": round(time.perf_counter() - started, 6),
+        "results": results,
+    }
 
 
 def main() -> None:
@@ -277,7 +374,10 @@ def main() -> None:
     args = parser.parse_args()
     try:
         request = json.loads(args.input.read_text(encoding="utf-8") if args.input else sys.stdin.read())
-        result = run_request(request)
+        if isinstance(request, dict) and "sources" in request:
+            result = run_batch_request(request)
+        else:
+            result = run_request(request)
     except (OSError, ValueError) as exc:
         result = {"version": "1.0", "stage": "moss_transcribe_diarize", "status": "not_run", "error": str(exc)}
     output = json.dumps(result, ensure_ascii=False, indent=2)

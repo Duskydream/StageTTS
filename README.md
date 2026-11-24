@@ -35,6 +35,8 @@
 
 ---
 
+> 当前配置更新：MOSS 输入上限已调整为 90 分钟（5400 秒），输出预算 65536 token，输入上下文 131072 token。以下历史 60 秒实测是资源测量范围，不再是应用上限。长音频的显存、耗时与质量需实际验证。
+
 ## 1. 项目一句话架构
 
 ```text
@@ -59,7 +61,7 @@ FFmpeg 混音导出 output.mp4
 
 MOSS 主模型固定至本地已审核 revision `10304d926740cf5a5cee05a268086e3265197910`，通过独立 `env_parse` 子进程运行；Banquet 分离、MOSS 联合转录与 GPT-SoVITS 合成串行接力显存。
 
-**时长边界：**MOSS 官方模型说明单次支持最长 **90 分钟**，但 StageTTS 当前配置 `MOSS_MAX_AUDIO_SECONDS=60`，是只在最长 60 秒样本验证过的保守接入上限，不是模型固有上限。超过 60 秒会在分离 / 推理前明确拒绝；目前尚未实现可生产的长视频分块和跨块说话人身份关联。即使是 8GB 显卡，90 分钟官方能力也不等于显存、速度或识别质量已验证。详见 [MOSS 设置与验证记录](docs/moss_setup.md)。
+**时长边界：**默认输入上限为 90 分钟（5400 秒），输出预算 65536 token，处理器上下文为 131072 token。模型按实际剩余上下文分配输出空间。当前 8GB 显卡实测仍只覆盖至 60 秒；长音频可能受到显存、耗时、上下文或输出长度限制，不能将放宽上限视为 90 分钟实测保证。
 
 MOSS 输出的是模型联合生成的**句段时间**与窗口内匿名角色标记；不是词级时间、独立重叠检测或跨窗口全局角色身份。保持来源证据和校对提示，禁止将未知角色静默映射为已确认说话人。
 
@@ -71,7 +73,7 @@ MOSS 输出的是模型联合生成的**句段时间**与窗口内匿名角色�
 
 | 模块 | 当前状态 | 说明 |
 | :--- | :---: | :--- |
-| MOSS 联合 ASR 与 diarization | 主解析路径 | Banquet → MOSS → LLM。已完成 MOSS 10 / 30 / 60 秒英日真实推理及独立短样例全流程接入。当前生产入口显式限制 60 秒；90 分钟是上游模型声明，不是本应用验证或承诺。MOSS 仅输出句段时间，词级对齐和准确率仍需审核。|
+| MOSS 联合 ASR 与 diarization | 主解析路径 | Banquet → MOSS → LLM。已完成 MOSS 10 / 30 / 60 秒英日真实推理及独立短样例全流程接入。当前输入上限为 90 分钟，实测覆盖至 60 秒；90 分钟是上游模型声明，不是本应用验证或承诺。MOSS 仅输出句段时间，词级对齐和准确率仍需审核。|
 | WhisperX + pyannote | 仅历史 / 显式回滚 | 不是默认或静默 fallback；缺少 MOSS 配置或推理失败时明确报错。|
 | `script.json` 数据契约 | 已完成 | Pydantic v2 与 TypeScript 类型 1:1 对齐 |
 | GPT-SoVITS 分组配音 | 已完成 | 按角色切换权重、按情绪选择参考音，缺失时使用与原文对应的同角色原声片段 |
@@ -235,7 +237,7 @@ Stage4 使用**全文源对白上下文 + 每批最多 25 条输出**，不是�
 这是当前开发机配置，推荐：
 
 - 使用本地 pinned `MOSS-Transcribe-Diarize`（BF16 / SDPA）；最长 60 秒已经在 8GB RTX 5060 Laptop 上实测，详见 [MOSS 实测](docs/moss_setup.md)；
-- `MOSS_MAX_NEW_TOKENS=4096` 是生成 token 上限，不是模型的 90 分钟官方输入能力；应用的 60 秒预算独立配置；
+- `MOSS_MAX_NEW_TOKENS=65536` 是生成 token 上限，不是模型的 90 分钟官方输入能力；应用的 90 分钟输入预算独立配置；
 - GPT-SoVITS 使用本仓库的 `backend/tts_v2.yaml`；
 - 模型缓存放到非系统盘。
 
@@ -245,7 +247,7 @@ Stage4 使用**全文源对白上下文 + 每批最多 25 条输出**，不是�
 
 ### 情况 C：显存 12GB 或更多
 
-MOSS 本身也支持更长录音，但模型卡的最长 90 分钟声明不代表本应用已支持或目标显卡能承受。当前 StageTTS 仍按最长 60 秒 fail-fast；提高预算需额外做长音频显存、速度、token 完整性及转录质量验证，不能直接据此承诺长视频支持。
+MOSS 默认允许最长 90 分钟。更长音频的显存、速度和结果完整性仍需要实测，8GB 显卡可能无法处理完整 90 分钟。
 
 ---
 
@@ -427,8 +429,8 @@ MOSS_REVISION=10304d926740cf5a5cee05a268086e3265197910
 MOSS_TORCH_VERSION=2.8.0+cu128
 MOSS_TRANSFORMERS_VERSION=5.6.0
 MOSS_CUSTOM_CODE_APPROVED=0 # 仅在本地固定官方代码已审阅并核验 hash 后设置为 1
-MOSS_MAX_AUDIO_SECONDS=60
-MOSS_MAX_NEW_TOKENS=4096
+MOSS_MAX_AUDIO_SECONDS=5400
+MOSS_MAX_NEW_TOKENS=65536
 BANQUET_ROOT=F:/Download/StageTTS/banquet/bandit-v2
 BANQUET_CHECKPOINT=F:/Download/StageTTS/banquet/banquet-split.ckpt
 HF_HOME=F:/Download/StageTTS/hf_cache
@@ -445,6 +447,12 @@ LLM_MODEL=workbuddy-ai/hy4flash-free
 ```
 
 The UI settings page persists model, endpoint and key in the ignored local backend settings file; keep secrets out of tracked documentation. Do not put access tokens in this example.
+
+#### 在 UI 中设置 GPT-SoVITS 微调方案
+
+顶部“设置”中的“GPT-SoVITS 模型与微调”提供 v2、v2Pro、v2ProPlus 底模以及独立的 GPT / SoVITS epoch（1–100 整数）。默认方案为 v2Pro、GPT 15 轮、SoVITS 10 轮；界面显示本地权重缺失情况和默认推理配置版本。方案保存至忽略跟踪的 `backend/training_settings.local.json`，不会切换当前推理权重、启动训练或表示这些轮数已经训练完成。
+
+训练入口和长视频训练集处理尚未接入。取得素材后需先按角色整理干净音频、校对逐字稿、划分训练与验证素材，再根据此方案生成实际训练配置。epoch 的合适值取决于训练数据和验证试听，不能只按轮数判断效果。
 
 #### 在 UI 中切换翻译模型
 
@@ -522,7 +530,7 @@ Banquet 四轨分离和 MOSS 主解析共享一个独立 CUDA 子进程环境；
 
 见 [MOSS 设置与验证文档](docs/moss_setup.md)。关键固定信息：Python 3.12、torch/torchaudio 2.8.0+cu128、transformers 5.6.0；MOSS revision 与权重 SHA-256 固定在该文档。先安装 CUDA 12.8 torch 栈，再安装 `workers/requirements-moss.txt`；隔离环境设为 `ENV_PARSE_PYTHON`，backend `.env` 配置 `PARSE_BACKEND=moss`、本地 `MOSS_MODEL_PATH`、固定 revision 与代码审批标志。
 
-MOSS 官方声明单次最长 90 分钟，但当前经最长 60 秒 GPU 样本验证的应用入口明确默认 `MOSS_MAX_AUDIO_SECONDS=60`。在更长时长完成内存、耗时与生成完整性验证前，不要把应用限制误写成已支持 90 分钟；完整长视频分块和跨块说话人身份关联尚未实现。
+MOSS 及应用默认输入上限为 90 分钟。最长 60 秒样例仅代表已完成的资源实测范围。输入/输出共享有限上下文；独立窗口的匿名说话人不能直接认作同一人。
 
 #### 缓存目录
 
@@ -657,13 +665,13 @@ ffmpeg -version
 
 ### Q4：MOSS 占用显存或解析失败
 
-MOSS 使用 BF16 / SDPA，短样例已在 RTX 5060 8GB 验证；系统会在解析前停止由后端托管的 GPT-SoVITS。关闭其他 GPU 程序；不要在模型初始化或解析任务仍运行时重启 backend。 MOSS 配置 / 权重失败时检查 `MOSS_MODEL_PATH`、固定 revision 和本地 hash manifest；应用时长超过 60 秒时当前会 fail-fast。
+MOSS 使用 BF16 / SDPA，短样例已在 RTX 5060 8GB 验证；系统会在解析前停止由后端托管的 GPT-SoVITS。关闭其他 GPU 程序；不要在模型初始化或解析任务仍运行时重启 backend。 MOSS 配置 / 权重失败时检查 `MOSS_MODEL_PATH`、固定 revision 和本地 hash manifest；应用时长超过配置的输入上限时会 fail-fast。
 
 ---
 
 ### Q5：MOSS 输入时长限制
 
-MOSS 官方模型卡声明可单次处理最长 90 分钟；StageTTS 目前为了守住已验证边界，默认只允许最多 60 秒音频。超限会 fail-fast，不会自动切窗或静默回退 Whisper。更长音频预算和跨窗说话人关联尚未完成，不能把上游模型能力当成本应用已支持。
+默认 MOSS 输入上限为 5400 秒（90 分钟）。如仍提示 60 秒超限，请确认本地配置为 `MOSS_MAX_AUDIO_SECONDS=5400` 并重启后端。输出预算为 `MOSS_MAX_NEW_TOKENS=65536`，实际还受模型剩余上下文和硬件资源限制。
 
 ---
 
@@ -748,7 +756,7 @@ StageTTS/
 
 新解析可在 `script.evidence` 保存独立源证据：原始ASR整句与字词、可重叠的diarization活动区间、源turn，以及翻译/表演单位的来源链接。exclusive轨是派生方便轨，不替代真实重叠活动。旧JSON缺少evidence时仍可打开，不能从旧TTS倒造源声证据。
 
-M2边界候选仅来自原文字符范围和已有alignment。分词器可注入，缺少JA/ZH词典时保守回退待审；可选LLM只能选择已有候选ID，不能发明时间戳或词中切点。默认主解析为固定 revision 的 MOSS joint ASR + 窗口内匿名角色 + 句段时间，使用独立 MOSS / Banquet 环境，旧 WhisperX / pyannote worker 只保留代码以供单独审查的 legacy 实验，不作为依赖清单、默认入口或自动 fallback。官方原精度BF16+SDPA已测JA/EN10、30、完整60秒单scope，当前预算60秒/4096输出token；更长输入明确拒绝，不能外推90分钟或自动切窗认同S01。MOSS不提供word时间，不按字符均分；`alignment_granularity`与独立句段审核保留这种能力差别。整段原文/边界与角色确认后可用完整3–10秒参考，超过10秒无词级对齐不允许裁剪。官方固定snapshot与本地custom code已hash验证，community-1暂停。
+M2边界候选仅来自原文字符范围和已有alignment。分词器可注入，缺少JA/ZH词典时保守回退待审；可选LLM只能选择已有候选ID，不能发明时间戳或词中切点。默认主解析为固定 revision 的 MOSS joint ASR + 窗口内匿名角色 + 句段时间，使用独立 MOSS / Banquet 环境，旧 WhisperX / pyannote worker 只保留代码以供单独审查的 legacy 实验，不作为依赖清单、默认入口或自动 fallback。官方原精度BF16+SDPA已测JA/EN10、30、完整60秒单scope，当前默认输入上限5400秒/65536输出token；超出配置输入预算明确拒绝，不能外推90分钟或自动切窗认同S01。MOSS不提供word时间，不按字符均分；`alignment_granularity`与独立句段审核保留这种能力差别。整段原文/边界与角色确认后可用完整3–10秒参考，超过10秒无词级对齐不允许裁剪。官方固定snapshot与本地custom code已hash验证，community-1暂停。
 
 源声韵律/情绪分析为显式操作，不跟随每次保存自动运行。精修面板显示证据链接与分析状态；`not_run`/`not_configured`/`blocked`不是neutral。CPU能量/活动区间等测量与模型情绪分数分开保存，原始分数不冒充校准概率，不由标签猜F0。GPT-SoVITS当前只应用参考路由；CV3/Index适配状态不代表已接通。
 

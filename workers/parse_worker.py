@@ -896,6 +896,22 @@ def _build_and_save_script(
     elif segments:
         translated = translate_script(script, create_openai_client(), lambda message: _log("Stage4", message))
         _log("Stage4", f"已翻译 {len(translated)}/{len(segments)} 条台词")
+        if script.source_lang:
+            try:
+                from backend.services.emotion_routing import build_character_emotion_refs
+
+                populated = build_character_emotion_refs(
+                    script,
+                    overwrite=False,
+                    log=lambda message: _log("Stage4", message),
+                )
+                if populated:
+                    summary = "、".join(
+                        f"{spk}({len(emos)})" for spk, emos in populated.items()
+                    )
+                    _log("Stage4", f"已自动匹配角色多情绪参考音：{summary}")
+            except Exception as exc:
+                _log("Stage4", f"自动匹配多情绪参考音跳过：{exc}")
 
     with tempfile.TemporaryDirectory(dir=args.output_dir) as temp:
         draft = Path(temp) / script_out.name
@@ -963,7 +979,18 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         _preflight_moss(device)
 
     # Publish new audio separately so a failed reparse preserves the previous script's tracks.
-    cinematic_dir = Path(tempfile.mkdtemp(prefix="cinematic-", dir=args.output_dir))
+    cache_key = {"input": str(args.input.resolve()), "size": args.input.stat().st_size,
+                 "mtime_ns": args.input.stat().st_mtime_ns}
+    cached = None
+    for folder in sorted(args.output_dir.glob("cinematic-*")):
+        marker = folder / "separation_complete.json"
+        try:
+            if json.loads(marker.read_text(encoding="utf-8")) == cache_key and all((folder / (name + ".wav")).is_file() for name in ("dialogue", "singing", "music", "effects", "bgm")):
+                cached = folder
+                break
+        except (OSError, ValueError):
+            pass
+    cinematic_dir = cached or Path(tempfile.mkdtemp(prefix="cinematic-", dir=args.output_dir))
     try:
         with tempfile.TemporaryDirectory(prefix="stagetts_work_") as work_tmp:
             extracted_wav = Path(work_tmp) / "extracted_audio.wav"
@@ -971,11 +998,15 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             if backend == "moss":
                 with wave.open(str(extracted_wav), "rb") as extracted_audio:
                     waveform_duration = extracted_audio.getnframes() / extracted_audio.getframerate()
-                if not 0 < waveform_duration <= min(config.MOSS_MAX_AUDIO_SECONDS, 60.0) + 0.05:
+                if not 0 < waveform_duration <= min(config.MOSS_MAX_AUDIO_SECONDS, 5400.0) + 0.05:
                     raise RuntimeError(f"MOSS initial audio budget exceeded or unknown waveform duration: {waveform_duration:.6f}s; "
-                                       "long-window strategy requires explicit validation before separation")
-            _stage_banquet(extracted_wav, cinematic_dir, device)
+                                       "audio exceeds configured MOSS input limit (maximum 90 minutes)")
+            if cached is None:
+                _stage_banquet(extracted_wav, cinematic_dir, device)
+            else:
+                _log("Stage1", "复用已完成且输入未改变的 Banquet 分轨")
             vocals_wav, bgm_wav, cinematic_stems = _finish_four_stems(cinematic_dir, args.project_id)
+            (cinematic_dir / "separation_complete.json").write_text(json.dumps(cache_key), encoding="utf-8")
 
         if backend == "moss":
             _log("Stage2", "MOSS joint ASR + speaker segment timestamps (no word alignment)")
@@ -1012,7 +1043,8 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             evidence_context=evidence_context,
         )
     except BaseException:
-        shutil.rmtree(cinematic_dir, ignore_errors=True)
+        if not (cinematic_dir / "separation_complete.json").is_file():
+            shutil.rmtree(cinematic_dir, ignore_errors=True)
         raise
 
     _cleanup_stale_cinematic_dirs(args.output_dir, keep=cinematic_dir)

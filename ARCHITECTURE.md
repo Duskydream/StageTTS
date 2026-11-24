@@ -52,7 +52,7 @@
 
 2. **RTX 5060 8GB（Blackwell `sm_120`）串行显存接力与单任务防 OOM**
    - `env_parse` 必须通过 `subprocess.run` 单独运行 `workers/parse_worker.py`，进程退出后由操作系统回收其 CUDA 显存。
-   - MOSS 使用 BF16 / SDPA；在 RTX 5060 8GB 上已经测试最长 60 秒样例（峰值保留约 1.965 GiB），这不是 90 分钟资源保证。应用默认 fail-fast 限制为 60 秒；长视频分块、跨块 speaker linking 尚未支持。
+   - MOSS 使用 BF16 / SDPA；在 RTX 5060 8GB 上已经测试最长 60 秒样例（峰值保留约 1.965 GiB），这不是 90 分钟资源保证。应用默认输入上限为 5400 秒（90 分钟），输出预算 65536 token；长视频分块、跨块 speaker linking 尚未支持。
    - 主后端必须使用 GPU 单任务锁，防止并发启动多个解析 / 合成任务。
 
 3. **按说话人（`speaker`）分组批量合成**

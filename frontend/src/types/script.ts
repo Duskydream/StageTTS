@@ -66,3 +66,6 @@ export type VoicePreset = components["schemas"]["VoicePreset"];
 export type VoicePresetCreateRequest = components["schemas"]["VoicePresetCreateRequest"];
 export type VoicePresetListResponse = components["schemas"]["VoicePresetListResponse"];
 export type VoicePresetDeleteResponse = components["schemas"]["VoicePresetDeleteResponse"];
+export type AutoEmotionRefsResponse = components["schemas"]["AutoEmotionRefsResponse"];
+export type FinetuneStartRequest = components["schemas"]["FinetuneStartRequest"];
+export type FinetuneJobStatus = components["schemas"]["FinetuneJobStatus"];

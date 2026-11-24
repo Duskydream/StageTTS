@@ -58,9 +58,36 @@ def check_tts_service(timeout: float = 1.5) -> bool:
 def _resolve_ref_for_segment(
     script: ProjectScript, character: CharacterConfig | None, segment: Segment,
 ) -> tuple[EmotionRef, Path] | None:
+    has_any_valid_manual = False
     if character:
         refs = character.emotion_refs
-        for emotion in dict.fromkeys((segment.emotion, "neutral", *refs)):
+        # 1. Exact emotion ref configured on character takes top priority.
+        exact = refs.get(segment.emotion)
+        if exact and exact.text.strip() and exact.lang.strip():
+            try:
+                path = config.resolve_media_path(exact.wav)
+                if path.is_file():
+                    return exact, path
+            except ValueError:
+                pass
+        # Check whether the character has any valid manual/populated ref at all.
+        for emotion in dict.fromkeys(("neutral", *refs)):
+            ref = refs.get(emotion)
+            if ref and ref.text.strip() and ref.lang.strip():
+                try:
+                    path = config.resolve_media_path(ref.wav)
+                    if path.is_file():
+                        has_any_valid_manual = True
+                        break
+                except ValueError:
+                    continue
+        # 2. If character has no configured refs, try emotion-matched automatic clip before neutral fallback.
+        if not has_any_valid_manual:
+            auto_emotion = automatic_reference(script, segment.speaker, emotion=segment.emotion)
+            if auto_emotion is not None:
+                return auto_emotion, config.resolve_media_path(auto_emotion.wav)
+        # 3. Fall back to character's configured neutral/other ref.
+        for emotion in dict.fromkeys(("neutral", *refs)):
             ref = refs.get(emotion)
             if ref and ref.text.strip() and ref.lang.strip():
                 try:
@@ -69,7 +96,7 @@ def _resolve_ref_for_segment(
                     continue
                 if path.is_file():
                     return ref, path
-    ref = automatic_reference(script, segment.speaker)
+    ref = automatic_reference(script, segment.speaker, emotion=segment.emotion)
     return (ref, config.resolve_media_path(ref.wav)) if ref else None
 
 

@@ -250,7 +250,8 @@ class MossWorkerTest(unittest.TestCase):
                     stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
                     stream.writeframes(b"\0\0" * 16000 * 61)
                 return 60.042  # Container metadata cannot override actual 61s waveform.
-            with patch.object(parse_worker, "_preflight_moss"), \
+            with patch.object(parse_worker.config, "MOSS_MAX_AUDIO_SECONDS", 60), \
+                 patch.object(parse_worker, "_preflight_moss"), \
                  patch.object(parse_worker, "_extract_wav_and_probe", side_effect=extract), \
                  patch.object(parse_worker, "_stage_banquet") as banquet, \
                  patch.object(parse_worker, "_stage_whisperx_asr_align") as legacy:
@@ -267,6 +268,23 @@ class MossWorkerTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not configured"):
                 parse_worker._stage_moss_transcribe(Path("unused.wav"), "cuda")
             legacy.assert_not_called()
+
+    def test_ninety_minute_budget_accepts_long_audio_and_larger_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request = self.fixture(Path(directory))
+            request.update(max_audio_seconds=5400, max_new_tokens=65536)
+            audio = Path(request["source"]["audio_path"])
+            with wave.open(str(audio), "wb") as stream:
+                stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                stream.writeframes(b"\0\0" * (16000 * 575))
+            with patch.object(importlib.metadata, "version", side_effect=self.versions):
+                self.assertEqual(moss_worker.validate_request(request)[2], 575)
+                request["max_audio_seconds"] = 5401
+                with self.assertRaisesRegex(ValueError, "5400"):
+                    moss_worker.validate_request(request)
+                request.update(max_audio_seconds=5400, max_new_tokens=65537)
+                with self.assertRaisesRegex(ValueError, "65536"):
+                    moss_worker.validate_request(request)
 
     def test_sixty_second_wave_budget_uses_frames_and_bounded_media_tail(self):
         with tempfile.TemporaryDirectory() as directory:

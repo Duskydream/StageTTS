@@ -4,6 +4,41 @@
  */
 
 export interface paths {
+    "/api/settings/training": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Training Settings */
+        get: operations["get_training_settings_api_settings_training_get"];
+        /** Put Training Settings */
+        put: operations["put_training_settings_api_settings_training_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/training/inference": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["put_inference_base_model_api_settings_training_inference_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+
     "/api/settings/llm": {
         parameters: {
             query?: never;
@@ -441,10 +476,142 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/projects/{project_id}/characters/{speaker}/emotion-refs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["auto_match_character_emotion_refs_api_projects__project_id__characters__speaker__emotion_refs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{project_id}/characters/{speaker}/finetune": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["start_character_finetune_api_projects__project_id__characters__speaker__finetune_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{project_id}/finetune/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["read_project_finetune_status_api_projects__project_id__finetune_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** InferenceModelUpdate */
+        InferenceModelUpdate: {
+            /** @enum {string} */
+            base_model: "v2" | "v2Pro" | "v2ProPlus";
+        };
+        /** AutoEmotionRefsRequest */
+        AutoEmotionRefsRequest: {
+            overwrite?: boolean;
+        };
+        /** AutoEmotionRefsResponse */
+        AutoEmotionRefsResponse: {
+            script: components["schemas"]["ProjectScript-Output"];
+            populated_emotions: string[];
+        };
+        /** FinetuneStartRequest */
+        FinetuneStartRequest: {
+            preset_name?: string | null;
+            allow_unreviewed?: boolean;
+            bind_to_character?: boolean;
+            save_as_preset?: boolean;
+        };
+        /** FinetuneJobStatus */
+        FinetuneJobStatus: {
+            job_id: string | null;
+            active: boolean;
+            project_id: string | null;
+            speaker: string | null;
+            base_model: string | null;
+            gpt_epochs: number | null;
+            sovits_epochs: number | null;
+            stage: string;
+            progress_pct: number;
+            clip_count: number;
+            usable_duration_sec: number;
+            gpt_weights: string | null;
+            sovits_weights: string | null;
+            preset_id: string | null;
+            warnings: string[];
+            logs: string[];
+            error: string | null;
+            updated_at: number;
+        };
+        /** TrainingModelOption */
+        TrainingModelOption: {
+            /** Id */
+            id: string;
+            /** Available */
+            available: boolean;
+            /** Missing Files */
+            missing_files: string[];
+        };
+        /** TrainingSettings */
+        TrainingSettings: {
+            /**
+             * Base Model
+             * @default v2Pro
+             * @enum {string}
+             */
+            base_model: "v2" | "v2Pro" | "v2ProPlus";
+            /**
+             * Gpt Epochs
+             * @default 15
+             */
+            gpt_epochs: number;
+            /**
+             * Sovits Epochs
+             * @default 10
+             */
+            sovits_epochs: number;
+        };
+        /** TrainingSettingsResponse */
+        TrainingSettingsResponse: {
+            settings: components["schemas"]["TrainingSettings"];
+            /** Models */
+            models: components["schemas"]["TrainingModelOption"][];
+            /** Inference Version */
+            inference_version: string | null;
+            /**
+             * Training Started
+             * @default false
+             */
+            training_started: boolean;
+        };
+
         /**
          * AgentChatRequest
          * @description 自然语言剪辑 Agent 对话请求。
@@ -1845,6 +2012,60 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    get_training_settings_api_settings_training_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingSettingsResponse"];
+                };
+            };
+        };
+    };
+    put_training_settings_api_settings_training_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrainingSettings"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingSettingsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+
     read_llm_settings_api_settings_llm_get: {
         parameters: {
             query?: never;
@@ -2073,7 +2294,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ProjectScript"];
+                    "application/json": components["schemas"]["ProjectScript-Output"];
                 };
             };
             /** @description Validation Error */
@@ -2592,6 +2813,104 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_inference_base_model_api_settings_training_inference_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceModelUpdate"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrainingSettingsResponse"];
+                };
+            };
+        };
+    };
+    auto_match_character_emotion_refs_api_projects__project_id__characters__speaker__emotion_refs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                speaker: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["AutoEmotionRefsRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutoEmotionRefsResponse"];
+                };
+            };
+        };
+    };
+    start_character_finetune_api_projects__project_id__characters__speaker__finetune_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                speaker: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["FinetuneStartRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FinetuneJobStatus"];
+                };
+            };
+        };
+    };
+    read_project_finetune_status_api_projects__project_id__finetune_status_get: {
+        parameters: {
+            query?: {
+                speaker?: string | null;
+            };
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FinetuneJobStatus"];
                 };
             };
         };

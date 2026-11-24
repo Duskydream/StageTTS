@@ -47,15 +47,15 @@ function createInitialNodes(config: PipelineConfig): StageFlowNode[] {
         vramGb: 0,
         status: "idle",
         inputs: [],
-        outputs: [{ id: "out-video", label: "原音视频", type: "MEDIA" }],
-        summary: "导入视频或音频",
+        outputs: [{ id: "out-video", label: "媒体", type: "MEDIA" }],
+        summary: "",
         params: { format: "mp4 / wav" },
       },
     },
     {
       id: "banquet",
       type: "stageNode",
-      position: { x: 260, y: 28 },
+      position: { x: 300, y: 20 },
       data: {
         title: "音轨分离",
         category: "parse",
@@ -64,49 +64,49 @@ function createInitialNodes(config: PipelineConfig): StageFlowNode[] {
         status: "idle",
         inputs: [{ id: "in-media", label: "媒体流", type: "MEDIA" }],
         outputs: [
-          { id: "out-vocals", label: "对白轨", type: "AUDIO" },
-          { id: "out-bgm", label: "背景轨", type: "AUDIO" },
+          { id: "out-vocals", label: "对白", type: "AUDIO" },
+          { id: "out-bgm", label: "背景", type: "AUDIO" },
         ],
-        summary: "Banquet 分离对白、歌声、伴奏和音效",
+        summary: "Banquet 4-Stem",
         params: { model: "banquet" },
       },
     },
     {
       id: "whisperx",
       type: "stageNode",
-      position: { x: 500, y: 18 },
+      position: { x: 580, y: 20 },
       data: {
-        title: "MOSS 语音识别与角色",
+        title: "MOSS 识别",
         category: "parse",
         env: "env_parse",
         vramGb: 2.0,
         status: "idle",
-        inputs: [{ id: "in-vocals", label: "对白轨", type: "AUDIO" }],
-        outputs: [{ id: "out-turns", label: "角色时间段", type: "SEGMENTS" }],
-        summary: "MOSS BF16 · 实测峰值约 2.0 GB（最长 60 秒样例）",
-        params: { model: "OpenMOSS-Team/MOSS-Transcribe-Diarize", precision: "bfloat16", max_audio_seconds: 60 },
+        inputs: [{ id: "in-vocals", label: "对白", type: "AUDIO" }],
+        outputs: [{ id: "out-turns", label: "句段", type: "SEGMENTS" }],
+        summary: "BF16 · ≤90m",
+        params: { model: "OpenMOSS-Team/MOSS-Transcribe-Diarize", precision: "bfloat16", max_audio_seconds: 5400 },
       },
     },
     {
       id: "llm_tagger",
       type: "stageNode",
-      position: { x: 740, y: 18 },
+      position: { x: 860, y: 20 },
       data: {
-        title: "翻译与情绪标注",
+        title: "翻译与情绪",
         category: "parse",
         env: "env_parse",
         vramGb: 1.1,
         status: "idle",
-        inputs: [{ id: "in-turns", label: "角色时间段", type: "SEGMENTS" }],
-        outputs: [{ id: "out-script-draft", label: "剧本初稿", type: "JSON" }],
-        summary: `目标语言: ${config.targetLang === "zh" ? "中文" : config.targetLang === "en" ? "英文" : "日语"}`,
+        inputs: [{ id: "in-turns", label: "句段", type: "SEGMENTS" }],
+        outputs: [{ id: "out-script-draft", label: "初稿", type: "JSON" }],
+        summary: "",
         params: { target_lang: config.targetLang },
       },
     },
     {
       id: "script_hub",
       type: "stageNode",
-      position: { x: 500, y: 205 },
+      position: { x: 580, y: 230 },
       data: {
         title: "剧本枢纽",
         category: "hub",
@@ -114,69 +114,50 @@ function createInitialNodes(config: PipelineConfig): StageFlowNode[] {
         vramGb: 0,
         status: "idle",
         inputs: [
-          { id: "in-draft", label: "剧本初稿", type: "JSON" },
-          { id: "in-bgm", label: "背景轨", type: "AUDIO" },
+          { id: "in-draft", label: "初稿", type: "JSON" },
+          { id: "in-bgm", label: "背景", type: "AUDIO" },
         ],
         outputs: [
-          { id: "out-script", label: "标准剧本", type: "SCRIPT" },
-          { id: "out-bgm-pass", label: "背景轨", type: "AUDIO" },
+          { id: "out-script", label: "剧本", type: "SCRIPT" },
+          { id: "out-bgm-pass", label: "背景", type: "AUDIO" },
         ],
-        summary: "多端共享单一数据源",
+        summary: "",
         params: { schema: "v2" },
       },
     },
     {
       id: "agent_tts",
       type: "stageNode",
-      position: { x: 740, y: 205 },
+      position: { x: 860, y: 230 },
       data: {
-        title: "语音合成与反思",
+        title: "语音合成",
         category: "synthesis",
         env: "env_tts",
         vramGb: 4.2,
         status: "idle",
-        inputs: [{ id: "in-script", label: "标准剧本", type: "SCRIPT" }],
-        outputs: [{ id: "out-wavs", label: "分句配音", type: "AUDIO[]" }],
-        summary: "超 15% 时最多改写两轮",
+        inputs: [{ id: "in-script", label: "剧本", type: "SCRIPT" }],
+        outputs: [{ id: "out-wavs", label: "配音", type: "AUDIO[]" }],
+        summary: "GPT-SoVITS",
         params: { overflow_ratio: 1.15, max_rounds: 2 },
       },
     },
     {
       id: "ffmpeg_mixer",
       type: "stageNode",
-      position: { x: 980, y: 112 },
+      position: { x: 1140, y: 110 },
       data: {
-        title: "视频混音导出",
+        title: "混音导出",
         category: "output",
         env: "env_backend",
         vramGb: 0,
         status: "idle",
         inputs: [
-          { id: "in-wavs", label: "分句配音", type: "AUDIO[]" },
-          { id: "in-bgm", label: "背景轨", type: "AUDIO" },
+          { id: "in-wavs", label: "配音", type: "AUDIO[]" },
+          { id: "in-bgm", label: "背景", type: "AUDIO" },
         ],
-        outputs: [{ id: "out-mp4", label: "成片视频", type: "MP4" }],
-        summary: config.burnWatermark ? "重编码烧录合规水印" : "无损流快速封装",
+        outputs: [{ id: "out-mp4", label: "成片", type: "MP4" }],
+        summary: "",
         params: { burn_watermark: config.burnWatermark },
-      },
-    },
-    {
-      id: "virtual_stage_out",
-      type: "stageNode",
-      position: { x: 980, y: 278 },
-      data: {
-        title: "虚拟舞台演播",
-        category: "output",
-        env: "frontend",
-        vramGb: 0.2,
-        status: "idle",
-        inputs: [
-          { id: "in-script-stage", label: "标准剧本", type: "SCRIPT" },
-          { id: "in-wavs-stage", label: "分句配音", type: "AUDIO[]" },
-        ],
-        outputs: [{ id: "out-canvas", label: "舞台画面", type: "CANVAS" }],
-        summary: "实时能量嘴型与动作驱动",
-        params: { renderer: "live2d" },
       },
     },
   ];
@@ -247,22 +228,6 @@ const INITIAL_EDGES: Edge[] = [
     targetHandle: "in-bgm",
     style: { stroke: "#5C5C5C", strokeWidth: 1.25, strokeDasharray: "4 4" },
   },
-  {
-    id: "e-hub-stage",
-    source: "script_hub",
-    sourceHandle: "out-script",
-    target: "virtual_stage_out",
-    targetHandle: "in-script-stage",
-    style: { stroke: "#AD925F", strokeWidth: 1.25, strokeDasharray: "4 4" },
-  },
-  {
-    id: "e-tts-stage",
-    source: "agent_tts",
-    sourceHandle: "out-wavs",
-    target: "virtual_stage_out",
-    targetHandle: "in-wavs-stage",
-    style: { stroke: "#698EAD", strokeWidth: 1.5 },
-  },
 ];
 
 function nowTimeStr(): string {
@@ -286,6 +251,7 @@ function makeLog(
 const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   targetLang: "zh",
   burnWatermark: false,
+  burnSubtitles: "none",
 };
 
 export function workflowPreflight(script: ProjectScript, config: PipelineConfig & { startStep: PipelineStartStep }, parseOnly: boolean): string | null {
@@ -342,6 +308,8 @@ interface WorkflowState {
   setWorkspacePreset: (preset: WorkspacePreset) => void;
   setCenterTab: (tab: CenterViewTab) => void;
   setRightTab: (tab: RightPanelTab) => void;
+  showWorkflowLogs: boolean;
+  toggleWorkflowLogs: (open?: boolean) => void;
   toggleLeftDrawer: (tab: Exclude<LeftDrawerTab, "none">) => void;
   selectNode: (nodeId: string | null) => void;
   onNodesChange: (changes: NodeChange<StageFlowNode>[]) => void;
@@ -368,6 +336,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   centerTab: "video",
   rightTab: "inspector",
   leftDrawer: "none",
+  showWorkflowLogs: false,
   selectedNodeId: null,
   nodes: createInitialNodes(DEFAULT_PIPELINE_CONFIG),
   edges: INITIAL_EDGES,
@@ -401,29 +370,24 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       set({
         workspacePreset: preset,
         centerTab: "graph",
-        rightTab: "node",
-      });
-      return;
-    }
-    if (preset === "stage") {
-      set({
-        workspacePreset: preset,
-        centerTab: "stage",
-        rightTab: "inspector",
       });
       return;
     }
     set((state) => ({
-      workspacePreset: preset,
+      workspacePreset: "editing",
       centerTab: "video",
-      rightTab:
-        state.rightTab === "node" || state.rightTab === "logs" ? "inspector" : state.rightTab,
+      rightTab: state.rightTab === "logs" ? "inspector" : state.rightTab,
     }));
   },
 
   setCenterTab: (centerTab) => set({ centerTab }),
 
   setRightTab: (rightTab) => set({ rightTab }),
+
+  toggleWorkflowLogs: (open) =>
+    set((state) => ({
+      showWorkflowLogs: open === undefined ? !state.showWorkflowLogs : open,
+    })),
 
   toggleLeftDrawer: (tab) =>
     set((state) => ({
@@ -434,7 +398,6 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     set((state) => ({
       selectedNodeId: nodeId,
       nodes: state.nodes.map((node) => ({ ...node, selected: node.id === nodeId })),
-      rightTab: nodeId ? "node" : state.rightTab,
     })),
 
   onNodesChange: (changes) =>
@@ -454,12 +417,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       if (state.isPipelineRunning) return state;
       const nextConfig = { ...state.pipelineConfig, ...patch };
       const nodes = state.nodes.map((node) => {
-        if (node.id === "whisperx") return { ...node, data: { ...node.data, vramGb: 2.0, summary: "MOSS BF16 · 实测峰值约 2.0 GB（最长 60 秒样例）" } };
+        if (node.id === "whisperx") return { ...node, data: { ...node.data, vramGb: 2.0, summary: "BF16 · ≤90m" } };
         if (node.id === "llm_tagger") {
-          const lang = nextConfig.targetLang === "zh" ? "中文" : nextConfig.targetLang === "en" ? "英文" : "日语";
-          return { ...node, data: { ...node.data, summary: `目标语言: ${lang}`, params: { ...node.data.params, target_lang: nextConfig.targetLang } } };
+          return { ...node, data: { ...node.data, params: { ...node.data.params, target_lang: nextConfig.targetLang } } };
         }
-        if (node.id === "ffmpeg_mixer") return { ...node, data: { ...node.data, summary: nextConfig.burnWatermark ? "重编码烧录合规水印" : "无损流快速封装", params: { ...node.data.params, burn_watermark: nextConfig.burnWatermark } } };
+        if (node.id === "ffmpeg_mixer") return { ...node, data: { ...node.data, params: { ...node.data.params, burn_watermark: nextConfig.burnWatermark } } };
         return node;
       });
       return { pipelineConfig: nextConfig, nodes };
@@ -485,13 +447,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     const projectState = useProjectStore.getState();
     const currentScript = projectState.script;
     if (!currentScript) {
-      set({ rightTab: "logs" });
+      set({ showWorkflowLogs: true });
       get().appendLog("system", "请先导入音视频或打开一个项目后再运行管线", "warn");
       return;
     }
 
     if (projectState.backendStatus !== "online") {
-      set({ rightTab: "logs" });
+      set({ showWorkflowLogs: true });
       get().appendLog("system", "后端未连接，真实管线已阻止；请连接后端后重试。", "error");
       return;
     }
@@ -501,14 +463,14 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     }
     const startStep = pipelineStartForNode(get().selectedNodeId);
     if (!startStep) {
-      set({ rightTab: "logs" });
+      set({ showWorkflowLogs: true });
       get().appendLog("system", pipelineNodeHint(get().selectedNodeId), "warn");
       return;
     }
     const cfg = { ...get().pipelineConfig, startStep };
     const preflight = workflowPreflight(currentScript, cfg, parseOnly);
     if (preflight) {
-      set({ rightTab: "logs" });
+      set({ showWorkflowLogs: true });
       get().appendLog("system", `管线已阻止：${preflight}`, "error");
       return;
     }
@@ -547,7 +509,6 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       isPauseRequested: false,
       isPipelinePaused: false,
       isStopRequested: false,
-      rightTab: "logs",
       nodes: state.nodes.map((node) => ({ ...node, data: { ...node.data, status: queued.has(node.id) ? "queued" : "idle" } })),
     }));
     let activeScript = currentScript;
@@ -754,7 +715,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
           .map((s) => s.id);
 
         setNodeStatus("agent_tts", "running");
-        setActiveEdges(["e-hub-tts", "e-tts-mixer", "e-tts-stage"]);
+        setActiveEdges(["e-hub-tts", "e-tts-mixer"]);
 
         if (pendingIds.length > 0) {
           get().appendLog(
@@ -797,10 +758,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       // -------------------------------------------------------------------
       activeNode = "ffmpeg_mixer";
       setNodeStatus("ffmpeg_mixer", "running");
-      setNodeStatus("virtual_stage_out", "running");
       get().appendLog("env_backend", "正在执行毫秒拼轨与 FFmpeg 混音封装...", "info");
 
-      const renderRes = await renderVideo(activeScript.project_id, cfg.burnWatermark);
+      const renderRes = await renderVideo(activeScript.project_id, { burn_watermark: cfg.burnWatermark, burn_subtitles: cfg.burnSubtitles });
       activeScript = {
         ...activeScript,
         media: { ...activeScript.media, output_video: renderRes.output_video },
@@ -809,7 +769,6 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         useProjectStore.getState().setScript(activeScript);
       }
       setNodeStatus("ffmpeg_mixer", "done");
-      setNodeStatus("virtual_stage_out", "done");
       get().appendLog("env_backend", `后续管线执行完毕，成片已输出：${renderRes.output_video}`, "success");
 
       setActiveEdges([]);
@@ -897,22 +856,20 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     await sleep(350);
 
     setNodeStatus("script_hub", "running");
-    setActiveEdges(["e-hub-tts", "e-hub-mixer-bgm", "e-hub-stage"]);
+    setActiveEdges(["e-hub-tts", "e-hub-mixer-bgm"]);
     await sleep(350);
     setNodeStatus("script_hub", "done");
 
     setNodeStatus("agent_tts", "running");
-    setActiveEdges(["e-tts-mixer", "e-tts-stage"]);
+    setActiveEdges(["e-tts-mixer"]);
     get().appendLog("env_tts", "按角色分组合成并检查时长约束 (4.2 GB)", "info");
     await sleep(700);
     setNodeStatus("agent_tts", "done");
 
     setNodeStatus("ffmpeg_mixer", "running");
-    setNodeStatus("virtual_stage_out", "running");
-    get().appendLog("env_backend", "混音封装与舞台同步完成", "success");
+    get().appendLog("env_backend", "混音封装完成", "success");
     await sleep(450);
     setNodeStatus("ffmpeg_mixer", "done");
-    setNodeStatus("virtual_stage_out", "done");
     setActiveEdges([]);
     set({ isPipelineRunning: false });
   },

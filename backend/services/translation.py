@@ -86,8 +86,9 @@ def complete_dialogue(client: OpenAI, system: str, payload: dict) -> list[dict]:
 
 
 class DialogueContext:
-    def __init__(self, script: ProjectScript):
+    def __init__(self, script: ProjectScript, *, acoustic_hints: dict[int, dict] | None = None):
         self.script = script
+        self.acoustic_hints = acoustic_hints or {}
         self.ordered = sorted(script.segments, key=lambda seg: (seg.start, seg.id))
         self.positions = {seg.id: index for index, seg in enumerate(self.ordered)}
 
@@ -110,7 +111,7 @@ class DialogueContext:
         if actual_duration is not None:
             units = len(re.sub(r"\s+", "", seg.target_text)) if cjk else len(seg.target_text.split())
             budget = min(budget, max(1, int(units * slot / actual_duration * 0.95)))
-        return {
+        item = {
             **self._line(seg),
             "target_lang": seg.target_lang,
             "emotion": seg.emotion,
@@ -121,6 +122,22 @@ class DialogueContext:
             "before": [self._line(other) for other in self.ordered[max(0, index - 2):index]],
             "after": [self._line(other) for other in self.ordered[index + 1:index + 3]],
         }
+        hint = self.acoustic_hints.get(seg.id)
+        if hint:
+            acoustic_entry = {
+                key: value
+                for key, value in (
+                    ("ser_top", hint.get("ser_top")),
+                    ("ser_score", hint.get("ser_score")),
+                    ("loudness_z", hint.get("rms_z")),
+                    ("pitch_span_hz", hint.get("f0_range_hz")),
+                    ("suggested_emotion", hint.get("suggested_emotion")),
+                )
+                if value is not None
+            }
+            if acoustic_entry:
+                item["acoustic_hint"] = acoustic_entry
+        return item
 
     def payload(self, entries: Iterable[dict]) -> dict:
         lines = list(entries)
@@ -339,7 +356,15 @@ def translate_script(
     log: Callable[[str], None] | None = None,
     errors: list[str] | None = None,
 ) -> list[int]:
-    context = DialogueContext(script)
+    acoustic_hints: dict[int, dict] = {}
+    if script.media.vocals_wav:
+        try:
+            from backend.services.emotion_routing import extract_segment_acoustics
+
+            acoustic_hints = extract_segment_acoustics(script, use_ser=True, allow_gpu_ser=False)
+        except Exception:
+            acoustic_hints = {}
+    context = DialogueContext(script, acoustic_hints=acoustic_hints)
     segments = [seg for seg in context.ordered if seg.orig_text.strip()]
     if not segments:
         return []
