@@ -391,11 +391,30 @@ export function subscribeParseStatus(
 export function synthesizeSegments(
   projectId: string,
   segmentIds?: number[],
+  options?: { autoAgentQa?: boolean },
 ): Promise<SynthesizeResponse> {
   return unwrap(
     apiClient.POST("/api/projects/{project_id}/synthesize", {
       params: { path: { project_id: projectId } },
-      body: { segment_ids: segmentIds ?? null },
+      body: {
+        segment_ids: segmentIds ?? null,
+        auto_agent_qa: Boolean(options?.autoAgentQa),
+      },
+    }),
+  );
+}
+
+export function runAutoQa(
+  projectId: string,
+  options?: { maxRounds?: number; autoSynthesize?: boolean },
+): Promise<AgentChatResponse> {
+  return unwrap(
+    apiClient.POST("/api/projects/{project_id}/agent/auto-qa", {
+      params: { path: { project_id: projectId } },
+      body: {
+        max_rounds: options?.maxRounds ?? 2,
+        auto_synthesize: options?.autoSynthesize ?? true,
+      },
     }),
   );
 }

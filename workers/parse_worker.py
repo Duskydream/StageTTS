@@ -64,8 +64,9 @@ from backend.schemas import (  # noqa: E402
     Segment,
 )
 from backend.services.evidence import build_source_evidence  # noqa: E402
-from backend.services.translation import create_openai_client, translate_script  # noqa: E402
+from backend.services.translation import create_director_client, create_openai_client, translate_script  # noqa: E402
 from workers.aligned_segments import normalize_segments  # noqa: E402
+from workers.moss_segmentation import refine_moss_segments  # noqa: E402
 
 SPEAKER_PALETTE = [
     "#3b82f6",
@@ -726,23 +727,35 @@ def _stage_moss_transcribe(vocals_wav: Path, device: str) -> Tuple[List[Dict[str
     if blocking_reasons:
         raise RuntimeError(f"MOSS generation requires review before import: {blocking_reasons}")
     scope_hash = hashlib.sha256(f"{source_id}:whole_recording".encode()).hexdigest()[:12]
-    raw_segments, normalized, spans = [], [], []
-    for index, row in enumerate(result["segments"]):
+    raw_segments, candidates, spans = [], [], []
+    for row in result["segments"]:
         label = str(row.get("speaker") or "UNKNOWN")
         speaker = f"MOSS_{scope_hash}_{label}" if label != "UNKNOWN" else "UNKNOWN"
         raw_segments.append({"start": row["start"], "end": row["end"], "text": row["text"], "words": [],
                              "generated_start": row.get("generated_start", row["start"]),
                              "generated_end": row.get("generated_end", row["end"]),
                              "review_reasons": [*row.get("review_reasons", []), *result.get("review_reasons", [])]})
-        normalized.append({"id": index, "start": row["start"], "end": row["end"], "speaker": speaker,
-                           "orig_text": row["text"], "words": [], "alignment_needs_review": True,
-                           "alignment_granularity": "segment", "timing_source": "moss_joint_generated",
-                           "segment_timing_needs_review": True,
-                           "speaker_needs_review": True,
-                           "speaker_fallback_reason": "moss_joint_generated_segment_requires_review"})
+        candidates.append({
+            "start": row["start"],
+            "end": row["end"],
+            "speaker": speaker,
+            "orig_text": row["text"],
+            "words": [],
+            "alignment_needs_review": True,
+            "alignment_granularity": "segment",
+            "timing_source": "moss_joint_generated",
+            "segment_timing_needs_review": True,
+            "speaker_needs_review": True,
+            "speaker_fallback_reason": "moss_joint_generated_segment_requires_review",
+        })
         if speaker != "UNKNOWN":
             spans.append({"start": row["start"], "end": row["end"], "speaker": speaker,
                           "review_reasons": ["moss_joint_generated_activity_unvalidated", *row.get("review_reasons", [])]})
+    normalized = refine_moss_segments(
+        candidates,
+        vocals_wav,
+        duration=result.get("duration_seconds"),
+    )
     context = {"raw_segments": raw_segments, "diarization_spans": spans, "exclusive_spans": [],
                "fallback_reason": "moss_joint_generated_segment_requires_review", "backend": "moss",
                "raw_generation": result["raw_text"], "speaker_scope": f"{source_id}:whole_recording",
@@ -894,13 +907,16 @@ def _build_and_save_script(
     if args.skip_llm or not config.is_llm_configured():
         _log("Stage4", "跳过翻译或未配置 LLM，保留识别原文")
     elif segments:
+        translator_client = create_openai_client()
+        director_client = create_director_client(translator_client)
         translated = translate_script(
             script,
-            create_openai_client(),
+            translator_client,
             lambda message: _log("Stage4", message),
             enable_analysis=(not args.no_natural_polish) or args.web_search,
             enable_polish=not args.no_natural_polish,
             enable_web_search=args.web_search,
+            director_client=director_client,
         )
         _log("Stage4", f"已翻译 {len(translated)}/{len(segments)} 条台词")
         if script.source_lang:

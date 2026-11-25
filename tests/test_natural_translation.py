@@ -434,6 +434,88 @@ class NaturalTranslationPipelineTests(unittest.TestCase):
             self.assertFalse(mock_parse.call_args.kwargs["natural_polish"])
             self.assertTrue(mock_parse.call_args.kwargs["web_search"])
 
+    def test_dual_llm_routes_director_and_translator_passes_and_injects_line_notes(self):
+        script = _make_script()
+        director_client = MagicMock()
+        director_client._stagetts_model = "director-pro"
+        translator_client = MagicMock()
+        translator_client._stagetts_model = "translator-fast"
+
+        director_client.chat.completions.create.side_effect = [
+            _completion({
+                "genre": "校园悬疑",
+                "tone": "紧张克制",
+                "character_styles": {"S01": "语速偏快"},
+                "relationships": ["S01 与 S02 为搭档"],
+                "glossary": {"Aegis": "埃癸斯"},
+                "uncertain_terms": [],
+                "scenes": [{"range": "0-1", "summary": "行动前确认秘密计划"}],
+                "line_notes": {
+                    "1": {"note": "压低声音提醒，带着不安和叮嘱感", "emotion": "sad"},
+                },
+            }),
+            _completion([
+                {
+                    "id": 0,
+                    "target_text": "X计划3天后就要开始了！",
+                    "self_check": {"semantic_complete": True, "omitted_info": ""},
+                },
+                {
+                    "id": 1,
+                    "target_text": "千万别忘了埃癸斯。",
+                    "self_check": {"semantic_complete": True, "omitted_info": ""},
+                },
+            ]),
+        ]
+        translator_client.chat.completions.create.side_effect = [
+            _completion([
+                {
+                    "id": 0,
+                    "target_text": "X计划将在3天后开始。",
+                    "emotion": "happy",
+                    "action": "point",
+                    "keep_original": False,
+                    "self_check": {"semantic_complete": True, "omitted_info": ""},
+                },
+                {
+                    "id": 1,
+                    "target_text": "不要忘记埃癸斯。",
+                    "emotion": "sad",
+                    "action": "nod",
+                    "keep_original": False,
+                    "self_check": {"semantic_complete": True, "omitted_info": ""},
+                },
+            ]),
+        ]
+
+        logs: list[str] = []
+        translated = translation.translate_script(
+            script,
+            translator_client,
+            log=logs.append,
+            enable_analysis=True,
+            enable_polish=True,
+            enable_web_search=False,
+            director_client=director_client,
+        )
+
+        self.assertEqual(translated, [0, 1])
+        self.assertEqual(director_client.chat.completions.create.call_count, 2)
+        self.assertEqual(translator_client.chat.completions.create.call_count, 1)
+        self.assertTrue(any("导演=director-pro / 翻译=translator-fast" in line for line in logs))
+
+        pass1_payload = json.loads(translator_client.chat.completions.create.call_args.kwargs["messages"][-1]["content"])
+        self.assertEqual(pass1_payload["show_bible"]["scenes"], [{"range": "0-1", "summary": "行动前确认秘密计划"}])
+        self.assertNotIn("line_notes", pass1_payload["show_bible"])
+        self.assertNotIn("director_note", pass1_payload["lines"][0])
+        self.assertEqual(pass1_payload["lines"][1]["director_note"], "压低声音提醒，带着不安和叮嘱感")
+        self.assertEqual(pass1_payload["lines"][1]["director_emotion"], "sad")
+
+        pass2_payload = json.loads(director_client.chat.completions.create.call_args_list[1].kwargs["messages"][-1]["content"])
+        self.assertEqual(pass2_payload["lines"][1]["director_note"], "压低声音提醒，带着不安和叮嘱感")
+        self.assertEqual(script.segments[1].target_text, "千万别忘了埃癸斯。")
+        self.assertEqual(script.segments[1].emotion, "sad")
+
 
 if __name__ == "__main__":
     unittest.main()

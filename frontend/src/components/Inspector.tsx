@@ -120,7 +120,7 @@ export const Inspector: React.FC = () => {
   const usedUnits = isCjk
     ? Array.from(segment.target_text.replace(/\s+/g, "")).length
     : segment.target_text.trim().split(/\s+/).filter(Boolean).length;
-  const recommendedUnits = Math.max(1, Math.floor(slotDuration * (isCjk ? 5 : 2.8)));
+  const recommendedUnits = Math.max(1, Math.floor(slotDuration * (isCjk ? 4.5 : 2.6)));
   const actualDuration = segment.actual_duration;
   const fillRatio = actualDuration ? actualDuration / slotDuration : 0;
   const isOverflow = isSegmentOverflow(segment);

@@ -11,24 +11,52 @@ from backend import config
 from backend.agent.prompts import DURATION_REFLECTION_PROMPT
 from backend.schemas import ProjectScript, Segment, SegmentDurationCheck
 from backend.services.media_mixer import apply_gentle_tempo
-from backend.services.translation import DialogueContext, LLMNotConfiguredError, complete_dialogue, create_openai_client
+from backend.services.translation import (
+    DialogueContext,
+    LLMNotConfiguredError,
+    complete_dialogue,
+    create_director_client,
+    create_openai_client,
+)
 from backend.services.tts_client import measure_wav_duration, synthesize_segments_grouped
 
 
-def _check_duration(seg: Segment) -> SegmentDurationCheck | None:
+def compute_tail_slack_map(
+    ordered: list[Segment], timeline_duration: float | None = None
+) -> dict[int, float]:
+    """为句尾留有充足空白槽的片段计算安全的尾音宽限时长（不侵入下一句或全片边界）。"""
+    slacks: dict[int, float] = {}
+    guard = 0.12
+    for idx, seg in enumerate(ordered):
+        slot = max(0.05, seg.end - seg.start)
+        next_seg = ordered[idx + 1] if idx + 1 < len(ordered) else None
+        raw_gap = next_seg.start - seg.end if next_seg is not None else 999.0
+        if timeline_duration is not None and timeline_duration > 0:
+            raw_gap = min(raw_gap, timeline_duration - seg.end)
+        usable_gap = max(0.0, raw_gap - guard)
+        slacks[seg.id] = round(min(config.DUB_TAIL_ALLOWANCE_SECONDS, slot * 0.22, usable_gap), 3)
+    return slacks
+
+
+def _check_duration(seg: Segment, *, tail_slack: float = 0.0) -> SegmentDurationCheck | None:
     """判断片段是否显著偏离原时间槽。
 
-    - too_long：actual > slot * 1.15
-    - too_short：actual < slot * 0.80（且槽位不小于 1 秒，避免把纯叹词强行扩写）
+    - too_long：actual > max(slot * 1.15, slot + tail_slack)
+    - too_short：actual < slot * 0.74 且缺口 >= 1.15s（或 fill < 0.58 且槽位 >= 1.0s），避免长段留出几秒冷场空隙，同时不折腾本就很短的句子。
     """
     slot = max(0.05, seg.end - seg.start)
     actual = seg.actual_duration
     if actual is None:
         return None
     fill = round(actual / slot, 3)
+    gap = slot - actual
     if fill > config.DURATION_OVERFLOW_RATIO:
+        if tail_slack > 0 and actual <= slot + tail_slack:
+            return None
         state = "too_long"
-    elif fill < config.DURATION_UNDERFLOW_RATIO and slot >= config.MIN_DURATION_REFLECTION_SECONDS:
+    elif slot >= config.MIN_DURATION_REFLECTION_SECONDS and (
+        fill < 0.58 or (fill < config.DURATION_UNDERFLOW_RATIO and gap >= config.MIN_UNDERFLOW_GAP_SECONDS)
+    ):
         state = "too_short"
     else:
         return None
@@ -44,11 +72,22 @@ def _check_duration(seg: Segment) -> SegmentDurationCheck | None:
     )
 
 
+def _resolve_reflection_client() -> OpenAI:
+    primary = create_openai_client()
+    # Keep unit tests that patch `synthesis.create_openai_client` with mocks isolated.
+    if isinstance(primary, OpenAI):
+        return create_director_client(primary)
+    return primary
+
+
 def _rewrite_overflow(
     client: OpenAI, script: ProjectScript, segments: dict[int, Segment], checks: list[SegmentDurationCheck]
 ) -> dict[int, str]:
     """让 LLM 按实际偏差改写：太长则精简，太短则自然补足衔接。"""
-    context = DialogueContext(script.model_copy(update={"segments": list(segments.values())}))
+    context = DialogueContext(
+        script.model_copy(update={"segments": list(segments.values())}),
+        show_bible=script.show_bible,
+    )
     payload = []
     for check in checks:
         seg = segments[check.segment_id]
@@ -144,19 +183,21 @@ def synthesize_with_duration_check(
 ) -> tuple[list[int], list[SegmentDurationCheck], list[str]]:
     synthesized_ids, errors = synthesize_segments_grouped(script, segment_ids)
     segments = {seg.id: seg for seg in script.segments}
+    ordered = sorted(script.segments, key=lambda seg: (seg.start, seg.id))
+    tail_slacks = compute_tail_slack_map(ordered, script.media.duration)
     client = None
     if auto_reflect:
         for _ in range(config.MAX_REFLECTION_ROUNDS):
             pending = [
                 check for seg_id in synthesized_ids
-                if (check := _check_duration(segments[seg_id])) is not None
+                if (check := _check_duration(segments[seg_id], tail_slack=tail_slacks.get(seg_id, 0.0))) is not None
             ]
             if not pending:
                 break
             ids = ", ".join(f"#{check.segment_id}" for check in pending)
             try:
                 if client is None:
-                    client = create_openai_client()
+                    client = _resolve_reflection_client()
                 rewrites = _rewrite_overflow(client, script, segments, pending)
             except LLMNotConfiguredError:
                 errors.append(f"片段 {ids} 未自动改写：未配置 LLM。")
@@ -183,13 +224,14 @@ def synthesize_with_duration_check(
     remaining: list[SegmentDurationCheck] = []
     for seg_id in synthesized_ids:
         seg = segments[seg_id]
-        check = _check_duration(seg)
+        slack = tail_slacks.get(seg_id, 0.0)
+        check = _check_duration(seg, tail_slack=slack)
         if check is None:
             continue
         try:
             _fit_wav(seg, check)
         except (OSError, RuntimeError, ValueError) as exc:
             errors.append(f"片段 #{seg_id} 自动调速失败：{exc}")
-        if final_check := _check_duration(seg):
+        if final_check := _check_duration(seg, tail_slack=slack):
             remaining.append(final_check)
     return synthesized_ids, remaining, errors

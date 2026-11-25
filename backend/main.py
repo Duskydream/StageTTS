@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import AsyncIterator, Dict, List
 from urllib.parse import urlparse
@@ -40,7 +40,7 @@ from backend.services.voice_presets import (
     create_voice_preset, delete_voice_preset, list_voice_presets,
 )
 from backend import config
-from backend.agent.orchestrator import run_agent_chat
+from backend.agent.orchestrator import run_agent_chat, run_auto_qa_loop
 from backend.agent.tools import (
     load_project_script,
     project_task_guard,
@@ -49,6 +49,7 @@ from backend.agent.tools import (
     synthesize_project,
 )
 from backend.schemas import (
+    AgentAutoQaRequest,
     AgentChatRequest,
     AgentChatResponse,
     ExportDirOption,
@@ -76,6 +77,7 @@ from backend.schemas import (
     VoicePresetDeleteResponse,
     VoicePresetListResponse,
 )
+from backend.services.cache_cleanup import cleanup_stage_caches
 from backend.services.media_mixer import check_ffmpeg_available
 from backend.services.subtitles import generate_ass_subtitles
 from backend.services.emotion_routing import build_character_emotion_refs
@@ -101,6 +103,7 @@ from backend.services.task_runner import (
 from backend.services.translation import (
     LLMNotConfiguredError,
     LLMServiceError,
+    create_director_client,
     create_openai_client,
     translate_script,
 )
@@ -115,10 +118,21 @@ config.ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
 _PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Run lightweight cache cleanup on backend startup without blocking readiness."""
+    try:
+        cleanup_stage_caches()
+    except Exception:
+        pass
+    yield
+
+
 app = FastAPI(
     title="StageTTS Backend API",
     version="0.2.0",
     description="基于剧本中间表示 script.json 与 Agent 协同的多角色配音及虚拟演播平台后端服务",
+    lifespan=_app_lifespan,
 )
 
 app.add_middleware(
@@ -302,6 +316,19 @@ def gpu_status() -> Dict[str, object]:
     return {"devices": read_gpu_memory()}
 
 
+class CacheCleanupResponse(BaseModel):
+    removed_dirs: int
+    removed_files: int
+    freed_bytes: int
+    freed_mb: float
+
+
+@app.post("/api/system/cleanup-cache", response_model=CacheCleanupResponse)
+def cleanup_system_cache() -> CacheCleanupResponse:
+    """手动触发或定时清理训练中间特征、临时目录及未引用的过期参考音缓存。"""
+    return CacheCleanupResponse(**cleanup_stage_caches())
+
+
 @app.get("/api/projects", response_model=ProjectListResponse)
 def list_projects() -> Dict[str, List[str]]:
     """列出 workspace/ 下所有包含 script.json 的有效项目 ID。"""
@@ -465,13 +492,16 @@ def retranslate_project(project_id: str, req: TranslationRequest | None = None) 
         batch_errors: list[str] = []
         natural_polish = bool(req.natural_polish) if req is not None else False
         web_search = bool(req.web_search) if req is not None else False
+        translator_client = create_openai_client()
+        director_client = create_director_client(translator_client)
         translated = translate_script(
             candidate,
-            create_openai_client(),
+            translator_client,
             errors=batch_errors,
             enable_analysis=natural_polish or web_search,
             enable_polish=natural_polish,
             enable_web_search=web_search,
+            director_client=director_client,
         )
         successful = set(translated) & eligible
         if not successful:
@@ -486,6 +516,8 @@ def retranslate_project(project_id: str, req: TranslationRequest | None = None) 
             if isinstance(term, str) and isinstance(mapped, str) and term.strip() and mapped.strip():
                 if term not in script.glossary:
                     script.glossary[term] = mapped
+        if candidate.show_bible:
+            script.show_bible = candidate.show_bible
 
         candidates = {seg.id: seg for seg in candidate.segments}
         for seg in script.segments:
@@ -708,8 +740,41 @@ def analyze_project_source(project_id: str, req: PerformanceAnalysisRequest) -> 
 
 @app.post("/api/projects/{project_id}/synthesize", response_model=SynthesizeResponse)
 def synthesize_project_segments(project_id: str, req: SynthesizeRequest) -> SynthesizeResponse:
-    """分组配音并执行双向时长闭环，返回最终剧本和仍偏离时间槽的片段。"""
-    return synthesize_project(_validate_project_id(project_id), req.segment_ids)
+    """分组配音并执行双向时长闭环（可选自动 Agent 质检调优），返回最终剧本和仍偏离时间槽的片段。"""
+    safe_id = _validate_project_id(project_id)
+    result = synthesize_project(safe_id, req.segment_ids)
+    if req.auto_agent_qa:
+        from backend.services.synthesis import _check_duration
+
+        qa_res = run_auto_qa_loop(safe_id, max_rounds=2, auto_synthesize=True)
+        merged_synth = sorted(set(result.synthesized_ids) | set(qa_res.synthesized_ids))
+        refreshed_overflow = [
+            check
+            for seg in qa_res.script.segments
+            if not seg.keep_original and seg.status == "ready"
+            and (check := _check_duration(seg)) is not None
+        ]
+        result = SynthesizeResponse(
+            project_id=safe_id,
+            synthesized_ids=merged_synth,
+            overflow_segments=refreshed_overflow,
+            errors=result.errors,
+            qa_summary=qa_res.reply,
+            script=qa_res.script,
+        )
+    return result
+
+
+@app.post("/api/projects/{project_id}/agent/auto-qa", response_model=AgentChatResponse)
+def agent_auto_qa(project_id: str, req: AgentAutoQaRequest | None = None) -> AgentChatResponse:
+    """触发全片自主 Agent 体检与局部调优闭环。"""
+    safe_id = _validate_project_id(project_id)
+    opts = req or AgentAutoQaRequest()
+    return run_auto_qa_loop(
+        safe_id,
+        max_rounds=opts.max_rounds,
+        auto_synthesize=opts.auto_synthesize,
+    )
 
 
 @app.post("/api/projects/{project_id}/agent/chat", response_model=AgentChatResponse)

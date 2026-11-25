@@ -12,6 +12,7 @@ from openai import OpenAI, OpenAIError
 from backend import config
 from backend.agent.prompts import (
     DIALOGUE_POLISH_PROMPT,
+    DIALOGUE_QA_TIGHTEN_PROMPT,
     DIRECTOR_TRANSLATE_PROMPT,
     GLOSSARY_WEB_REFINE_PROMPT,
     SCRIPT_ANALYSIS_PROMPT,
@@ -19,12 +20,13 @@ from backend.agent.prompts import (
 )
 from backend.schemas import ProjectScript, Segment
 from backend.services import web_search
+from backend.services.text_normalization import clean_dubbing_text
 
 EMOTIONS = {"neutral", "angry", "happy", "sad", "whisper"}
 CONTEXT_INSTRUCTIONS = (
     "先通读完整对白理解剧情、角色关系和前后语气，再按原句 id 还原译文。"
     "参照相邻台词、角色语气、show_bible 与术语表；术语出现时使用固定译法。"
-    "语义完整优先：在符合目标语自然口语语序与配音气口的前提下完整传达语义，不得摘要、概括、省略关键事实或改成名词短语；min_units/max_units 只是软预算。"
+    "语义完整且贴合戏剧时长：中文配音舒适语速约 4.5 字/秒，译文长度应尽量落在 [min_units, max_units] 区间（偏近 max_units 的 90%），既不超时拖沓，也不要过度精简删减导致长段冷场空隙；严禁斜杠备选词。"
     "只处理 lines 中的片段 ID。"
 )
 
@@ -59,6 +61,19 @@ def create_openai_client() -> OpenAI:
         raise LLMNotConfiguredError("请在设置页面配置 LLM API Key、接口地址与模型名称。")
     client = OpenAI(api_key=snapshot.api_key, base_url=snapshot.base_url, timeout=config.LLM_TIMEOUT_SEC)
     client._stagetts_model = snapshot.model
+    return client
+
+
+def create_director_client(fallback_client: OpenAI | None = None) -> OpenAI:
+    from backend.services.llm_settings import get_llm_snapshot
+    snapshot = get_llm_snapshot()
+    if not snapshot.has_custom_director():
+        return fallback_client if fallback_client is not None else create_openai_client()
+    if not snapshot.director_configured():
+        raise LLMNotConfiguredError("导演模型配置不完整，请检查导演模型的 API Key 与接口地址。")
+    d_url, d_model, d_key = snapshot.effective_director()
+    client = OpenAI(api_key=d_key, base_url=d_url, timeout=config.LLM_TIMEOUT_SEC)
+    client._stagetts_model = d_model
     return client
 
 
@@ -207,19 +222,23 @@ class DialogueContext:
             effective_speech_sec = min(slot, max(0.55, slot * min(1.0, active_ratio * 1.15)))
             pause_sec = round(max(0.0, slot - effective_speech_sec), 2)
             pace = self.speaker_pace_scale.get(seg.speaker, 1.0)
-            budget = max(1, int(effective_speech_sec * (4.6 if cjk else 2.6) * pace))
+            budget = max(1, int(effective_speech_sec * (4.5 if cjk else 2.6) * pace))
         else:
-            budget = max(1, int(slot * (5.0 if cjk else 2.8)))
+            budget = max(1, int(slot * (4.6 if cjk else 2.7)))
         if actual_duration is not None:
             units = len(re.sub(r"\s+", "", seg.target_text)) if cjk else len(seg.target_text.split())
-            budget = min(budget, max(1, int(units * slot / actual_duration * 0.95)))
+            if actual_duration > slot:
+                budget = min(budget, max(1, int(units * slot / actual_duration * 0.92)))
+            else:
+                # For underflowing lines, allow expanding back toward natural fill (~0.88x slot).
+                budget = max(budget, int(units * slot / max(0.2, actual_duration) * 0.88))
         item = {
             **self._line(seg),
             "target_lang": seg.target_lang,
             "emotion": seg.emotion,
             "slot_sec": round(slot, 3),
             "unit": "characters" if cjk else "words",
-            "min_units": max(1, int(budget * 0.55)),
+            "min_units": max(1, int(budget * 0.78)),
             "max_units": budget,
             "before": [self._line(other) for other in self.ordered[max(0, index - 2):index]],
             "after": [self._line(other) for other in self.ordered[index + 1:index + 3]],
@@ -240,7 +259,20 @@ class DialogueContext:
             }
             if acoustic_entry:
                 item["acoustic_hint"] = acoustic_entry
+        line_notes = self.show_bible.get("line_notes")
+        if isinstance(line_notes, dict):
+            note_entry = line_notes.get(str(seg.id))
+            if isinstance(note_entry, dict):
+                note_text = str(note_entry.get("note") or "").strip()
+                note_emotion = str(note_entry.get("emotion") or "").strip()
+                if note_text:
+                    item["director_note"] = note_text
+                if note_emotion in EMOTIONS:
+                    item["director_emotion"] = note_emotion
         return item
+
+    def _public_show_bible(self) -> dict:
+        return {k: v for k, v in self.show_bible.items() if k != "line_notes" and v}
 
     def payload(self, entries: Iterable[dict]) -> dict:
         lines = list(entries)
@@ -256,8 +288,9 @@ class DialogueContext:
             "batch_ids": [line.get("id") for line in lines],
             "lines": lines,
         }
-        if self.show_bible:
-            data["show_bible"] = self.show_bible
+        bible = self._public_show_bible()
+        if bible:
+            data["show_bible"] = bible
         return data
 
     def whole_dialogue_payload(
@@ -324,8 +357,9 @@ class DialogueContext:
                 "只输出 JSON 数组：[{\"id\": int, \"target_text\": str, \"self_check\": {\"semantic_complete\": bool, \"omitted_info\": str}}]。"
             ),
         }
-        if self.show_bible:
-            data["show_bible"] = self.show_bible
+        bible = self._public_show_bible()
+        if bible:
+            data["show_bible"] = bible
         return data
 
 
@@ -461,7 +495,7 @@ def _apply_translation(
     *,
     preserve_metadata: bool = False,
 ) -> bool:
-    text = text.strip()
+    text = clean_dubbing_text(text)
     complete, omitted = _self_check_flags(entry, require=preserve_metadata)
     if complete is False or omitted or not text:
         return False
@@ -510,7 +544,7 @@ def _merge_glossary_entries(
     for raw_term, raw_target in additions.items():
         if not isinstance(raw_term, str) or not isinstance(raw_target, str):
             continue
-        term, target = raw_term.strip(), raw_target.strip()
+        term, target = raw_term.strip(), clean_dubbing_text(raw_target)
         if not term or not target:
             continue
         if term in protected_keys:
@@ -605,8 +639,44 @@ def _analyze_script(
         if cleaned_styles:
             show_bible["character_styles"] = cleaned_styles
 
+    raw_scenes = analysis.get("scenes")
+    if isinstance(raw_scenes, list):
+        cleaned_scenes = []
+        for scene in raw_scenes:
+            if not isinstance(scene, dict):
+                continue
+            scene_range = str(scene.get("range") or "").strip()
+            scene_summary = str(scene.get("summary") or "").strip()
+            if scene_range and scene_summary:
+                cleaned_scenes.append({"range": scene_range, "summary": scene_summary})
+        if cleaned_scenes:
+            show_bible["scenes"] = cleaned_scenes
+
+    raw_line_notes = analysis.get("line_notes")
+    if isinstance(raw_line_notes, dict):
+        cleaned_notes: dict[str, dict[str, str]] = {}
+        for raw_id, raw_note in raw_line_notes.items():
+            if not isinstance(raw_note, dict):
+                continue
+            seg_key = str(raw_id).strip()
+            if not seg_key:
+                continue
+            note_text = str(raw_note.get("note") or "").strip()
+            note_emotion = str(raw_note.get("emotion") or "").strip()
+            cleaned_entry: dict[str, str] = {}
+            if note_text:
+                cleaned_entry["note"] = note_text
+            if note_emotion in EMOTIONS:
+                cleaned_entry["emotion"] = note_emotion
+            if cleaned_entry:
+                cleaned_notes[seg_key] = cleaned_entry
+        if cleaned_notes:
+            show_bible["line_notes"] = cleaned_notes
+
     if log:
-        log(f"Pass 0 完成：自动补全 {styles_filled} 个角色风格，新增 {terms_added} 条术语")
+        note_count = len(show_bible.get("line_notes") or {})
+        extra = f"，导演批注 {note_count} 条" if note_count else ""
+        log(f"Pass 0 完成：自动补全 {styles_filled} 个角色风格，新增 {terms_added} 条术语{extra}")
 
     raw_uncertain = analysis.get("uncertain_terms")
     uncertain_terms = [
@@ -700,6 +770,93 @@ def _polish_batch(
     return polished_count
 
 
+def _text_quality_issues(seg: Segment, context: DialogueContext) -> list[str]:
+    """Identify post-translation density or spoken-form defects for Director QA."""
+    text = (seg.target_text or "").strip()
+    if not text or seg.keep_original:
+        return []
+    entry = context.entry(seg)
+    cjk = entry["unit"] == "characters"
+    units = len(re.sub(r"\s+", "", text)) if cjk else len(text.split())
+    max_units = int(entry["max_units"])
+    slot = max(0.2, seg.end - seg.start)
+    issues: list[str] = []
+    if re.search(r"[\u4e00-\u9fff]\s*[／/]\s*[\u4e00-\u9fff]", text):
+        issues.append("包含双选斜杠，不符合口语朗读")
+    if units >= 12 and max_units >= 4 and units > int(round(max_units * 1.15)):
+        issues.append(f"台词偏长（{units}/{max_units} {entry['unit']}，预计语速偏赶）")
+    if slot >= 4.5 and max_units >= 15 and units < int(round(max_units * 0.70)):
+        issues.append(f"台词偏短（{units}/{entry['min_units']}-{max_units} {entry['unit']}，长槽位易留大空白），请还原原文修饰与口语衔接")
+    if cjk and units <= 5 and slot <= 1.2 and re.search(r"(?:\.{2,}|…+)\s*$", text):
+        issues.append("短句末尾带省略号，易导致合成拖音")
+    return issues
+
+
+def _director_pre_qa(
+    director: OpenAI,
+    context: DialogueContext,
+    segments: list[Segment],
+    *,
+    log: Callable[[str], None] | None = None,
+) -> int:
+    """Run targeted Director QA tightening on flagged dense or malformed lines only."""
+    flagged: list[tuple[Segment, list[str]]] = []
+    for seg in segments:
+        reasons = _text_quality_issues(seg, context)
+        if reasons:
+            flagged.append((seg, reasons))
+    if not flagged:
+        return 0
+    if log:
+        log(f"Pre-TTS 导演终审：发现 {len(flagged)} 条台词偏长或含口语瑕疵，正在自动精炼")
+
+    chunk = 12
+    updated_count = 0
+    for offset in range(0, len(flagged), chunk):
+        part = flagged[offset:offset + chunk]
+        allowed_ids = {seg.id for seg, _ in part}
+        seg_by_id = {seg.id: seg for seg, _ in part}
+        lines = []
+        for seg, reasons in part:
+            item = context.entry(seg)
+            item["draft_text"] = seg.target_text
+            item["qa_issues"] = reasons
+            item.pop("target_text", None)
+            lines.append(item)
+        payload = {
+            "source_lang": context.script.source_lang,
+            "target_lang": part[0][0].target_lang,
+            "glossary": context.script.glossary,
+            "batch_ids": [item["id"] for item in lines],
+            "lines": lines,
+        }
+        bible = context._public_show_bible()
+        if bible:
+            payload["show_bible"] = bible
+        try:
+            entries = complete_dialogue(director, DIALOGUE_QA_TIGHTEN_PROMPT, payload, temperature=0.3)
+        except (OpenAIError, ValueError, IndexError, json.JSONDecodeError) as exc:
+            if log:
+                log(f"Pre-TTS 导演终审跳过：{exc}")
+            continue
+        for entry in entries:
+            seg_id = entry.get("id")
+            text = entry.get("target_text")
+            if type(seg_id) is not int or seg_id not in allowed_ids or not isinstance(text, str):
+                continue
+            seg = seg_by_id[seg_id]
+            complete, omitted = _self_check_flags(entry, require=True)
+            if not complete or omitted:
+                continue
+            if _fidelity_issues(seg, text, context.script.glossary, include_length=False):
+                continue
+            if _apply_translation(seg, text, entry, preserve_metadata=True):
+                updated_count += 1
+    if log and updated_count:
+        log(f"Pre-TTS 导演终审完成：自动精炼 {updated_count} 条台词")
+    return updated_count
+
+
 def translate_script(
     script: ProjectScript,
     client: OpenAI,
@@ -709,7 +866,11 @@ def translate_script(
     enable_analysis: bool = False,
     enable_polish: bool = False,
     enable_web_search: bool = False,
+    director_client: OpenAI | None = None,
 ) -> list[int]:
+    active_director = director_client or client
+    if log and director_client is not None and director_client is not client:
+        log(f"双层 LLM 模式：导演={client_model(active_director)} / 翻译={client_model(client)}")
     acoustic_hints: dict[int, dict] = {}
     if script.media.vocals_wav:
         try:
@@ -728,11 +889,15 @@ def translate_script(
         show_bible = _analyze_script(
             script,
             ordered_segments,
-            client,
+            active_director,
             target_lang=target_lang,
             enable_web_search=enable_web_search,
             log=log,
         )
+        if show_bible:
+            script.show_bible = show_bible
+    elif script.show_bible:
+        show_bible = dict(script.show_bible)
 
     context = DialogueContext(script, acoustic_hints=acoustic_hints, show_bible=show_bible)
     segments = [seg for seg in context.ordered if seg.orig_text.strip()]
@@ -826,8 +991,12 @@ def translate_script(
         if enable_polish:
             polish_candidates = [seg for seg in batch if seg.id in completed_ids and not seg.keep_original]
             if polish_candidates:
-                polished = _polish_batch(client, context, polish_candidates, full_segments=segments, log=log)
+                polished = _polish_batch(active_director, context, polish_candidates, full_segments=segments, log=log)
                 if log and polished:
                     log(f"Pass 2 完成：口语润色片段 #{batch[0].id}..#{batch[-1].id} 共 {polished}/{len(polish_candidates)} 条")
+
+    if enable_polish and completed_ids:
+        qa_candidates = [seg for seg in segments if seg.id in completed_ids and not seg.keep_original]
+        _director_pre_qa(active_director, context, qa_candidates, log=log)
 
     return sorted(set(translated))

@@ -7,6 +7,7 @@ import { useWorkflowStore } from "../store/useWorkflowStore";
 import type { EmotionType } from "../types/script";
 import { normalizeSpeakerColor } from "../utils/speakerColor";
 import { isSegmentOverflow, isSegmentTooShort } from "../utils/synthesisIssues";
+import { DubbingRange } from "./DubbingRange";
 
 type TimelineFilter = "all" | "review" | "pending" | "issue";
 
@@ -31,6 +32,7 @@ export const TimelinePR: React.FC = () => {
   const script = useProjectStore((s) => s.script);
   const selectedSegmentId = useProjectStore((s) => s.selectedSegmentId);
   const currentTime = useProjectStore((s) => s.currentTime);
+  const dubbingRange = useProjectStore((s) => s.dubbingRange);
   const isPlaying = useProjectStore((s) => s.isPlaying);
   const timelineZoom = useProjectStore((s) => s.timelineZoom);
   const trackStates = useProjectStore((s) => s.trackStates);
@@ -683,6 +685,16 @@ export const TimelinePR: React.FC = () => {
               ))}
             </div>
 
+            {dubbingRange && (
+              <div
+                style={{
+                  left: `${dubbingRange.start * timelineZoom}px`,
+                  width: `${Math.max(2, (dubbingRange.end - dubbingRange.start) * timelineZoom)}px`,
+                }}
+                className="pointer-events-none absolute bottom-0 top-6 z-[5] border-x border-[#4FA882]/45 bg-[#4FA882]/[0.07]"
+              />
+            )}
+
             {/* 时间标尺 (24px)：底部 5px 小短刻度，彻底去掉亮色方框 */}
             <div
               onClick={handleRulerSeek}
@@ -907,6 +919,7 @@ export const TimelinePR: React.FC = () => {
           </div>
         </div>
       </div>
+      <DubbingRange />
     </div>
   );
 };

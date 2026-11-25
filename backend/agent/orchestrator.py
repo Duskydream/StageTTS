@@ -1,15 +1,17 @@
-"""大模型 Function Calling 多轮调度器与时长约束反思闭环。"""
+"""大模型 Function Calling 多轮调度器、时长约束反思闭环与自主质检循环。"""
 
 from __future__ import annotations
 
 import json
 from typing import Any, Dict, List
 
-from backend import config
-from backend.agent.prompts import EDITING_AGENT_SYSTEM_PROMPT
+from openai import OpenAI
+
+from backend.agent.prompts import AUTO_QA_AGENT_PROMPT, EDITING_AGENT_SYSTEM_PROMPT
 from backend.agent.tools import (
     TOOL_REGISTRY,
     TOOLS_SCHEMA,
+    inspect_project_quality,
     load_project_script,
     synthesize_segments,
 )
@@ -18,7 +20,11 @@ from backend.schemas import (
     SegmentDurationCheck,
     ToolCallLog,
 )
-from backend.services.translation import create_openai_client, client_model
+from backend.services.translation import (
+    client_model,
+    create_director_client,
+    create_openai_client,
+)
 from backend.services.tts_client import TTSServiceUnavailableError
 
 _TOOL_ALLOWED_ARGS: Dict[str, set[str]] = {
@@ -27,13 +33,31 @@ _TOOL_ALLOWED_ARGS: Dict[str, set[str]] = {
 }
 
 
+def _resolve_agent_client() -> OpenAI:
+    primary = create_openai_client()
+    # Keep unit tests patching `orchestrator.create_openai_client` with mocks isolated.
+    if isinstance(primary, OpenAI):
+        return create_director_client(primary)
+    return primary
+
+
 def _summarize_tool_result(tool_name: str, result: Dict[str, Any]) -> str:
+    if tool_name == "inspect_project_quality":
+        return f"全片体检完成：共发现 {result.get('issue_count', 0)} 条待优化片段"
     if tool_name == "query_script":
         return f"查询到 {result.get('count', 0)} 条片段"
     if tool_name == "batch_update_segments":
         updated = result.get("updated_ids", [])
         pending = result.get("marked_pending_ids", [])
         return f"更新片段 {updated}（待重合成: {pending}）"
+    if tool_name == "split_segment":
+        return (
+            f"已拆分片段 #{result.get('left_id')} -> "
+            f"#{result.get('left_id')} & #{result.get('right_id')} "
+            f"(@ {result.get('split_time_sec')}s)"
+        )
+    if tool_name == "merge_segments":
+        return f"已合并片段 {result.get('removed_ids')} -> #{result.get('kept_id')}"
     if tool_name == "synthesize_segments":
         synth = result.get("synthesized_ids", [])
         durations = result.get("overflow_segments", [])
@@ -50,39 +74,19 @@ def _summarize_tool_result(tool_name: str, result: Dict[str, Any]) -> str:
     return "执行完成"
 
 
-def run_agent_chat(
+def _run_tool_loop(
     project_id: str,
-    user_message: str,
-    auto_synthesize: bool = True,
+    *,
+    system_prompt: str,
+    user_content: str,
+    auto_synthesize: bool,
+    max_steps: int = 6,
+    client: OpenAI | None = None,
 ) -> AgentChatResponse:
-    """自然语言批量剪辑 Agent 主调度入口（严格通过 5 大确定性工具白名单执行）。"""
-    client = create_openai_client()
-    script = load_project_script(project_id)
-
-    project_context = {
-        "project_id": script.project_id,
-        "mode": script.mode,
-        "duration": script.media.duration,
-        "bgm_volume": script.media.bgm_volume,
-        "has_cinematic_stems": script.media.cinematic_stems is not None,
-        "stem_volumes": script.media.stem_volumes.model_dump() if script.media.stem_volumes else None,
-        "auto_ducking": script.media.auto_ducking,
-        "characters": {
-            key: char.display_name for key, char in script.characters.items()
-        },
-        "segment_count": len(script.segments),
-        "auto_synthesize": auto_synthesize,
-    }
-
+    active_client = client or _resolve_agent_client()
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": EDITING_AGENT_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"当前项目上下文：\n{json.dumps(project_context, ensure_ascii=False)}\n\n"
-                f"用户指令：{user_message}"
-            ),
-        },
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
     ]
 
     tool_logs: List[ToolCallLog] = []
@@ -107,9 +111,9 @@ def run_agent_chat(
             overflow[check.segment_id] = check
         synthesis_errors.extend(result["errors"])
 
-    for _ in range(6):
-        completion = client.chat.completions.create(
-            model=client_model(client),
+    for _ in range(max_steps):
+        completion = active_client.chat.completions.create(
+            model=client_model(active_client),
             messages=messages,  # type: ignore[arg-type]
             tools=TOOLS_SCHEMA,  # type: ignore[arg-type]
             tool_choice="auto",
@@ -181,8 +185,8 @@ def run_agent_chat(
                     )
                 )
 
-                if tool_name == "batch_update_segments":
-                    pending_modified.update(result["marked_pending_ids"])
+                if tool_name in {"batch_update_segments", "split_segment", "merge_segments"}:
+                    pending_modified.update(result.get("marked_pending_ids") or [])
             except Exception as exc:
                 result = {"error": str(exc)}
                 tool_logs.append(
@@ -218,6 +222,8 @@ def run_agent_chat(
         final_reply += f"\n配音仍超出时间槽：{details}。"
     if synthesis_errors:
         final_reply += "\n" + "\n".join(dict.fromkeys(synthesis_errors))
+    if final_reply == "已完成指令处理。" and tool_logs:
+        final_reply = "已执行：" + "；".join(log.result_summary for log in tool_logs)
 
     latest_script = load_project_script(project_id)
     return AgentChatResponse(
@@ -226,4 +232,92 @@ def run_agent_chat(
         tool_logs=tool_logs,
         synthesized_ids=sorted(synthesized_ids),
         script=latest_script,
+    )
+
+
+def run_agent_chat(
+    project_id: str,
+    user_message: str,
+    auto_synthesize: bool = True,
+) -> AgentChatResponse:
+    """自然语言批量剪辑 Agent 主调度入口（严格通过确定性工具白名单执行）。"""
+    script = load_project_script(project_id)
+    project_context = {
+        "project_id": script.project_id,
+        "mode": script.mode,
+        "duration": script.media.duration,
+        "bgm_volume": script.media.bgm_volume,
+        "has_cinematic_stems": script.media.cinematic_stems is not None,
+        "stem_volumes": script.media.stem_volumes.model_dump() if script.media.stem_volumes else None,
+        "auto_ducking": script.media.auto_ducking,
+        "characters": {
+            key: char.display_name for key, char in script.characters.items()
+        },
+        "segment_count": len(script.segments),
+        "auto_synthesize": auto_synthesize,
+    }
+    return _run_tool_loop(
+        project_id,
+        system_prompt=EDITING_AGENT_SYSTEM_PROMPT,
+        user_content=(
+            f"当前项目上下文：\n{json.dumps(project_context, ensure_ascii=False)}\n\n"
+            f"用户指令：{user_message}"
+        ),
+        auto_synthesize=auto_synthesize,
+        max_steps=6,
+    )
+
+
+def run_auto_qa_loop(
+    project_id: str,
+    *,
+    max_rounds: int = 2,
+    auto_synthesize: bool = True,
+) -> AgentChatResponse:
+    """自动执行全片质检（翻译密度/硬伤/切分/音频异常），必要时调度导演 Agent 局部修复并重配。"""
+    report = inspect_project_quality(project_id)
+    script = load_project_script(project_id)
+    if report["issue_count"] == 0:
+        return AgentChatResponse(
+            project_id=project_id,
+            reply="全片自动体检通过：未发现译文过密、斜杠硬伤、切分碎片或音频时长异常。",
+            tool_logs=[
+                ToolCallLog(
+                    tool_name="inspect_project_quality",
+                    arguments={"project_id": project_id},
+                    result_summary="全片体检完成：0 个待优化项",
+                )
+            ],
+            synthesized_ids=[],
+            script=script,
+        )
+
+    compact_bible = {
+        k: v for k, v in (script.show_bible or {}).items()
+        if k != "line_notes" and v
+    }
+    qa_context = {
+        "project_id": project_id,
+        "source_lang": script.source_lang,
+        "glossary": script.glossary,
+        "characters": {
+            spk: {"display_name": ch.display_name, "speaking_style": ch.speaking_style}
+            for spk, ch in script.characters.items()
+        },
+        "show_bible": compact_bible,
+        "initial_diagnostics": {
+            "issue_count": report["issue_count"],
+            "code_counts": report["code_counts"],
+            "issues": report["issues"][:18],
+        },
+    }
+    return _run_tool_loop(
+        project_id,
+        system_prompt=AUTO_QA_AGENT_PROMPT,
+        user_content=(
+            "请基于以下自动体检报告和设定表执行精准局部修复（不要改动无问题片段）：\n"
+            f"{json.dumps(qa_context, ensure_ascii=False)}"
+        ),
+        auto_synthesize=auto_synthesize,
+        max_steps=max(4, max_rounds * 3),
     )

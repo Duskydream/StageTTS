@@ -15,10 +15,10 @@ from backend.schemas import ProjectScript, Segment
 from backend.services.media_mixer import apply_gentle_tempo
 from workers.prosody_worker import read_wav
 
-_MIN_SEGMENT_FOR_PAUSES_SEC = 3.6
-_MIN_PAUSE_SEC = 0.35
-_MIN_ISLAND_SEC = 0.65
-_MAX_ISLANDS = 3
+_MIN_SEGMENT_FOR_PAUSES_SEC = 4.5
+_MIN_PAUSE_SEC = 0.65
+_MIN_ISLAND_SEC = 0.75
+_MAX_ISLANDS = 2
 _CLAUSE_RE = re.compile(r"[^，。！？；…,.!?;\n]+[，。！？；…,.!?;\n]*")
 
 
@@ -201,6 +201,11 @@ def plan_segment_pause_synthesis(
         return None
     islands = detect_speech_islands(vocals_path, seg.start, seg.end)
     if not islands:
+        return None
+    # Require genuine dramatic silence gaps (>= 14% of segment duration) to avoid chopping fluid speech.
+    total_pause = sum(max(0.0, islands[i + 1][0] - islands[i][1]) for i in range(len(islands) - 1))
+    slot = max(0.1, seg.end - seg.start)
+    if total_pause / slot < 0.14:
         return None
     return align_clauses_to_islands(seg.target_text, seg.target_lang, islands)
 

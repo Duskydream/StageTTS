@@ -42,6 +42,11 @@ export function getCacheBustedUrl(
 
 export type BackendStatus = "connecting" | "online" | "offline";
 
+export interface DubbingRange {
+  start: number;
+  end: number;
+}
+
 export interface TrackStates {
   videoMuted: boolean;
   dubMuted: boolean;
@@ -66,6 +71,7 @@ interface ProjectState {
   projectList: string[];
   trackStates: TrackStates;
   timelineZoom: number;
+  dubbingRange: DubbingRange | null;
   /** 记录每个片段最后一次重合成的时间戳，用于音频防缓存 */
   audioVersionMap: Record<number, number>;
   pastScripts: ProjectScript[];
@@ -83,6 +89,7 @@ interface ProjectState {
   setCurrentTime: (time: number) => void;
   setIsPlaying: (playing: boolean) => void;
   setTimelineZoom: (zoom: number) => void;
+  setDubbingRange: (range: DubbingRange | null) => void;
   toggleTrackState: (key: keyof TrackStates) => void;
   bumpAudioVersion: (segmentIds: number[]) => void;
   commitHistoryCheckpoint: () => void;
@@ -107,6 +114,11 @@ interface ProjectState {
   retranslate: () => Promise<string>;
   loadProjectScript: (projectId: string) => Promise<void>;
   saveProjectScript: () => Promise<void>;
+  synthesizeRange: (range?: DubbingRange | null) => Promise<{
+    simulated: boolean;
+    message: string;
+    issues?: string[];
+  }>;
   synthesizeSegment: (segmentIds?: number[]) => Promise<{
     simulated: boolean;
     message: string;
@@ -319,6 +331,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   projectList: [],
   trackStates: { ...DEFAULT_TRACK_STATES },
   timelineZoom: 72,
+  dubbingRange: null,
   audioVersionMap: {},
   pastScripts: [],
   futureScripts: [],
@@ -352,6 +365,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       selectedSegmentId: null,
       currentTime: 0,
       isPlaying: false,
+      dubbingRange: null,
       isDirty: false,
       pastScripts: [],
       futureScripts: [],
@@ -407,6 +421,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         selectedSegmentId: created.segments[0]?.id ?? null,
         currentTime: 0,
         isPlaying: false,
+        dubbingRange: null,
         isLoading: false,
         isDirty: false,
         pastScripts: [],
@@ -552,6 +567,26 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   setIsPlaying: (playing) => set({ isPlaying: playing }),
 
   setTimelineZoom: (zoom) => set({ timelineZoom: Math.max(30, Math.min(180, Math.round(zoom))) }),
+
+  setDubbingRange: (range) =>
+    set((state) => {
+      if (!range) {
+        return { dubbingRange: null };
+      }
+      const duration = Math.max(
+        1,
+        state.script?.media.duration ?? 30,
+        ...(state.script?.segments.map((seg) => seg.end) ?? [0]),
+      );
+      const start = Math.max(0, Math.min(duration - 0.2, range.start));
+      const end = Math.min(duration, Math.max(start + 0.2, range.end));
+      return {
+        dubbingRange: {
+          start: Number(start.toFixed(2)),
+          end: Number(end.toFixed(2)),
+        },
+      };
+    }),
 
   toggleTrackState: (key) =>
     set((state) => ({
@@ -1248,6 +1283,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         selectedSegmentId: data.segments[0]?.id ?? null,
         currentTime: 0,
         isPlaying: false,
+        dubbingRange: null,
         isLoading: false,
         isDirty: false,
         pastScripts: [],
@@ -1305,6 +1341,30 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         error: err instanceof Error ? err.message : "保存失败",
       });
     }
+  },
+
+  synthesizeRange: async (range) => {
+    const state = get();
+    const script = state.script;
+    const targetRange = range ?? state.dubbingRange;
+    if (!script) {
+      return { simulated: true, message: "请先打开项目" };
+    }
+    if (!targetRange) {
+      return { simulated: false, message: "请先设置配音选区" };
+    }
+    const targetIds = script.segments
+      .filter(
+        (seg) =>
+          !seg.keep_original &&
+          seg.end > targetRange.start + 0.05 &&
+          seg.start < targetRange.end - 0.05,
+      )
+      .map((seg) => seg.id);
+    if (targetIds.length === 0) {
+      return { simulated: false, message: "选区内没有可配音片段" };
+    }
+    return get().synthesizeSegment(targetIds);
   },
 
   synthesizeSegment: async (segmentIds) => {

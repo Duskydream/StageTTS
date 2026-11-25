@@ -345,6 +345,9 @@ class ProjectScript(BaseModel):
     media: MediaInfo
     source_lang: str | None = None
     glossary: Dict[str, str] = Field(default_factory=dict, json_schema_extra={"default": {}})
+    show_bible: Optional[Dict[str, Any]] = Field(
+        default=None, description="导演分析生成的全片设定表（供后续改写与自动质检复用）",
+    )
     characters: Dict[str, CharacterConfig] = Field(
         default_factory=dict, json_schema_extra={"default": {}},
     )
@@ -493,6 +496,10 @@ class SynthesizeRequest(BaseModel):
         default=None,
         description="待合成片段 ID 列表；为空时合成全部 status != ready 且非 keep_original 的片段",
     )
+    auto_agent_qa: bool = Field(
+        default=False,
+        description="合成后是否自动执行 Director/Agent 质检与局部调优闭环",
+    )
 
 
 class TranslationRequest(BaseModel):
@@ -539,7 +546,15 @@ class SynthesizeResponse(BaseModel):
         default_factory=list, json_schema_extra={"default": []},
     )
     errors: List[str] = Field(default_factory=list, json_schema_extra={"default": []})
+    qa_summary: Optional[str] = Field(default=None, description="合成后 Agent 自动质检与调优摘要")
     script: ProjectScript
+
+
+class AgentAutoQaRequest(BaseModel):
+    """触发全片 Agent 自动诊断与调优闭环请求。"""
+
+    max_rounds: int = Field(default=2, ge=1, le=4, description="最多自动诊断调优轮数")
+    auto_synthesize: bool = Field(default=True, description="调优修改后是否自动触发局部重合成")
 
 
 class AgentChatRequest(BaseModel):

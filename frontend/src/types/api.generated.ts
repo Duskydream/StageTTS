@@ -352,6 +352,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/projects/{project_id}/agent/auto-qa": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Agent Auto Qa
+         * @description 触发全片自主 Agent 体检与局部调优闭环。
+         */
+        post: operations["agent_auto_qa_api_projects__project_id__agent_auto_qa_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/projects/{project_id}/agent/chat": {
         parameters: {
             query?: never;
@@ -942,6 +962,14 @@ export interface components {
             api_key_configured: boolean;
             /** Configured */
             configured: boolean;
+            /** Director Base Url */
+            director_base_url?: string;
+            /** Director Model */
+            director_model?: string;
+            /** Director Api Key Configured */
+            director_api_key_configured?: boolean;
+            /** Director Configured */
+            director_configured?: boolean;
         };
         /** LLMSettingsUpdate */
         LLMSettingsUpdate: {
@@ -956,6 +984,17 @@ export interface components {
              * @default false
              */
             clear_api_key: boolean;
+            /** Director Base Url */
+            director_base_url?: string | null;
+            /** Director Model */
+            director_model?: string | null;
+            /** Director Api Key */
+            director_api_key?: string | null;
+            /**
+             * Clear Director Api Key
+             * @default false
+             */
+            clear_director_api_key?: boolean;
         };
         /**
          * MediaInfo
@@ -1152,6 +1191,10 @@ export interface components {
             glossary: {
                 [key: string]: string;
             };
+            /** Show Bible */
+            show_bible?: {
+                [key: string]: unknown;
+            } | null;
             /**
              * Characters
              * @default {}
@@ -1193,6 +1236,10 @@ export interface components {
             glossary: {
                 [key: string]: string;
             };
+            /** Show Bible */
+            show_bible?: {
+                [key: string]: unknown;
+            } | null;
             /**
              * Characters
              * @default {}
@@ -1822,6 +1869,24 @@ export interface components {
              * @description 待合成片段 ID 列表；为空时合成全部 status != ready 且非 keep_original 的片段
              */
             segment_ids?: number[] | null;
+            /** Auto Agent Qa */
+            auto_agent_qa?: boolean;
+        };
+        /**
+         * AgentAutoQaRequest
+         * @description 触发全片 Agent 自动诊断与调优闭环请求。
+         */
+        AgentAutoQaRequest: {
+            /**
+             * Max Rounds
+             * @default 2
+             */
+            max_rounds?: number;
+            /**
+             * Auto Synthesize
+             * @default true
+             */
+            auto_synthesize?: boolean;
         };
         /**
          * SynthesizeResponse
@@ -1845,6 +1910,8 @@ export interface components {
              * @default []
              */
             errors: string[];
+            /** Qa Summary */
+            qa_summary?: string | null;
             script: components["schemas"]["ProjectScript-Output"];
         };
         /**
@@ -2623,6 +2690,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SynthesizeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    agent_auto_qa_api_projects__project_id__agent_auto_qa_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["AgentAutoQaRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentChatResponse"];
                 };
             };
             /** @description Validation Error */

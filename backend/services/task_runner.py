@@ -604,8 +604,15 @@ def run_parse_worker(
         sub_env["HF_TOKEN"] = config.HF_TOKEN
     from backend.services.llm_settings import get_llm_snapshot
     llm = get_llm_snapshot()
-    sub_env.update(LLM_API_KEY=llm.api_key, LLM_BASE_URL=llm.base_url,
-                   LLM_MODEL=llm.model, STAGETTS_LLM_SNAPSHOT="1")
+    sub_env.update(
+        LLM_API_KEY=llm.api_key,
+        LLM_BASE_URL=llm.base_url,
+        LLM_MODEL=llm.model,
+        DIRECTOR_LLM_API_KEY=llm.director_api_key,
+        DIRECTOR_LLM_BASE_URL=llm.director_base_url,
+        DIRECTOR_LLM_MODEL=llm.director_model,
+        STAGETTS_LLM_SNAPSHOT="1",
+    )
 
     with gpu_task_guard():
         _reset_parse_progress(project_id)

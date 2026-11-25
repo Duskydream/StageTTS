@@ -99,6 +99,9 @@ class _StageTTSSettingsFields(BaseModel):
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     llm_base_url: str = Field(default="https://api.openai.com/v1", alias="LLM_BASE_URL")
     llm_model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
+    director_llm_api_key: str = Field(default="", alias="DIRECTOR_LLM_API_KEY")
+    director_llm_base_url: str = Field(default="", alias="DIRECTOR_LLM_BASE_URL")
+    director_llm_model: str = Field(default="", alias="DIRECTOR_LLM_MODEL")
     hf_token: str = Field(default="", alias="HF_TOKEN")
 
 
@@ -226,16 +229,23 @@ LLM_API_KEY: str = settings.llm_api_key.strip()
 LLM_BASE_URL: str = settings.llm_base_url.strip()
 LLM_MODEL: str = settings.llm_model.strip()
 
+# 导演模型 API（可选，留空时复用主模型）
+DIRECTOR_LLM_API_KEY: str = settings.director_llm_api_key.strip()
+DIRECTOR_LLM_BASE_URL: str = settings.director_llm_base_url.strip()
+DIRECTOR_LLM_MODEL: str = settings.director_llm_model.strip()
+
 # HuggingFace pyannote 鉴权 Token
 HF_TOKEN: str = settings.hf_token.strip()
 
 # 时长约束反思闭环核心阈值（见 ARCHITECTURE.md 铁律 #6）
 DURATION_OVERFLOW_RATIO: float = 1.15
-DURATION_UNDERFLOW_RATIO: float = 0.80
+DUB_TAIL_ALLOWANCE_SECONDS: float = 0.45
+DURATION_UNDERFLOW_RATIO: float = 0.74
+MIN_UNDERFLOW_GAP_SECONDS: float = 1.15
 MIN_DURATION_REFLECTION_SECONDS: float = 1.0
 MAX_REFLECTION_ROUNDS: int = 2
 MAX_GENTLE_SPEED: float = 1.15
-MIN_GENTLE_SPEED: float = 0.85
+MIN_GENTLE_SPEED: float = 0.88
 
 # CORS 默认放行端口（Vite 开发服务器）
 ALLOWED_ORIGINS: list[str] = [

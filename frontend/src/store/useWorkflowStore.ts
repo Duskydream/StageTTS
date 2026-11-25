@@ -750,13 +750,18 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
             `开始调用 GPT-SoVITS 合成 ${pendingIds.length} 条待合成片段...`,
             "info",
           );
-          const synthRes = await synthesizeSegments(activeScript.project_id, pendingIds);
+          const synthRes = await synthesizeSegments(activeScript.project_id, pendingIds, {
+            autoAgentQa: true,
+          });
           activeScript = synthRes.script;
           if (isSameProject()) {
             useProjectStore.getState().setScript(activeScript);
             useProjectStore.getState().bumpAudioVersion(synthRes.synthesized_ids);
           }
 
+          if (synthRes.qa_summary) {
+            get().appendLog("env_backend", `导演 Agent 自动质检：${synthRes.qa_summary}`, "info");
+          }
           for (const issue of synthesisIssues(synthRes)) {
             get().appendLog("env_tts", issue, "warn");
           }

@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend import config
 from backend.agent.tools import load_project_script, project_task_guard, save_project_script
 from backend.schemas import ProjectScript, Segment, VoicePresetCreateRequest
+from backend.services.cache_cleanup import cleanup_finetune_artifacts
 from backend.services.emotion_routing import _non_overlapping_ids, build_character_emotion_refs
 from backend.services.references import _trimmed_transcript, _verified_word_offsets
 from backend.services.task_runner import GpuBusyError, ensure_tts_stopped, gpu_task_guard
@@ -124,6 +125,11 @@ def _append_log(project_id: str, line: str, *, stage: str | None = None, progres
         if cleaned:
             job.logs = [*job.logs, cleaned[:240]][-80:]
         job.updated_at = time.time()
+
+
+def has_active_finetune_job() -> bool:
+    with _jobs_lock:
+        return any(job.active for job in _jobs_by_project.values())
 
 
 def get_finetune_status(project_id: str, speaker: str | None = None) -> FinetuneJobStatus:
@@ -510,6 +516,50 @@ def _execute_pipeline(plan: ValidatedFinetunePlan, req: FinetuneStartRequest) ->
     opt_dir = root / "logs" / exp_name
     opt_dir.mkdir(parents=True, exist_ok=True)
 
+    kept_weights: dict[str, Path | None] = {"gpt": None, "sovits": None}
+    try:
+        _execute_pipeline_steps(
+            plan,
+            req,
+            exp_name=exp_name,
+            dataset_dir=dataset_dir,
+            wav_dir=wav_dir,
+            opt_dir=opt_dir,
+            kept_weights=kept_weights,
+        )
+    finally:
+        freed_bytes = cleanup_finetune_artifacts(
+            dataset_dir,
+            opt_dir,
+            exp_name=exp_name,
+            keep_gpt=kept_weights["gpt"],
+            keep_sovits=kept_weights["sovits"],
+            base_model=base_model,
+            root=root,
+        )
+        if freed_bytes > 0:
+            _append_log(
+                project_id,
+                f"已自动清理训练中间缓存 {freed_bytes / (1024 * 1024):.1f} MB",
+            )
+
+
+def _execute_pipeline_steps(
+    plan: ValidatedFinetunePlan,
+    req: FinetuneStartRequest,
+    *,
+    exp_name: str,
+    dataset_dir: Path,
+    wav_dir: Path,
+    opt_dir: Path,
+    kept_weights: dict[str, Path | None],
+) -> None:
+    project_id = plan.script.project_id
+    speaker = plan.speaker
+    recipe = plan.recipe
+    root = plan.root
+    base_model = recipe.base_model
+
     _ensure_local_tts_released()
     _append_log(
         project_id,
@@ -649,6 +699,7 @@ def _execute_pipeline(plan: ValidatedFinetunePlan, req: FinetuneStartRequest) ->
         f"{exp_name}_e{plan.effective_sovits_epochs}_s*.pth",
         f"{exp_name}_e*.pth",
     )
+    kept_weights["sovits"] = sovits_file
     sovits_rel_path = f"{sovits_dir_rel}/{sovits_file.name}"
     time.sleep(1.5)
 
@@ -697,6 +748,7 @@ def _execute_pipeline(plan: ValidatedFinetunePlan, req: FinetuneStartRequest) ->
             f"{exp_name}-e{plan.effective_gpt_epochs}.ckpt",
             f"{exp_name}-e*.ckpt",
         )
+        kept_weights["gpt"] = gpt_file
         gpt_rel_path = f"{gpt_dir_rel}/{gpt_file.name}"
     else:
         _append_log(
