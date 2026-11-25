@@ -393,7 +393,7 @@ function SpeakerEditor({
   const clipStats = useMemo(() => {
     const clean = segments.filter((seg) => {
       const dur = seg.end - seg.start;
-      if (seg.keep_original || !seg.orig_text.trim() || dur < 1.5 || dur > 15.0) return false;
+      if (seg.keep_original || !seg.orig_text.trim() || dur < 1.0) return false;
       return !script.segments.some(
         (other) => other.id !== seg.id && other.start < seg.end && other.end > seg.start,
       );
@@ -405,6 +405,8 @@ function SpeakerEditor({
       confirmedCount: confirmed.length,
       unreviewedCount: clean.length - confirmed.length,
       totalSeconds: totalSec,
+      isFewShotCandidate: totalSec >= 6.0 && (totalSec < 20.0 || clean.length < 6),
+      belowMinimum: clean.length < 2 || totalSec < 6.0,
     };
   }, [script.segments, segments]);
 
@@ -648,6 +650,16 @@ function SpeakerEditor({
             {finetuneStatus?.active ? "训练中" : startingFinetune ? "准备中" : "开始微调"}
           </button>
         </div>
+        {clipStats.isFewShotCandidate && (
+          <div className="text-[10px] text-secondary">
+            少样本防过拟合模式：自动冻结 GPT 仅微调 SoVITS 音色
+          </div>
+        )}
+        {clipStats.belowMinimum && (
+          <div className="text-[10px] text-muted">
+            微调至少需 2 句且累计 ≥ 6s 无重叠干声
+          </div>
+        )}
         {finetuneMsg && <div className="text-[10px] text-secondary">{finetuneMsg}</div>}
         {finetuneStatus && finetuneStatus.stage !== "idle" && (
           <div className="space-y-1 rounded bg-[#181818] p-2 text-[10px]">

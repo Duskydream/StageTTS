@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
 from collections.abc import Callable, Iterable
 
 from openai import OpenAI, OpenAIError
@@ -124,6 +125,42 @@ def complete_dialogue(
     return [entry for entry in entries if isinstance(entry, dict)]
 
 
+def _compute_speaker_pace_scales(
+    script: ProjectScript,
+    acoustic_hints: dict[int, dict],
+) -> dict[str, float]:
+    """Measure each speaker's relative speaking rate on active audio windows."""
+    if not acoustic_hints:
+        return {}
+    per_speaker: dict[str, list[float]] = {}
+    all_rates: list[float] = []
+    source_cjk = (script.source_lang or "").removeprefix("all_").split("-")[0] in {"zh", "ja", "yue", "ko"}
+    for seg in script.segments:
+        text = seg.orig_text.strip()
+        dur = seg.end - seg.start
+        hint = acoustic_hints.get(seg.id)
+        if not text or dur < 1.2 or not hint or seg.speaker == "UNKNOWN":
+            continue
+        active_ratio = float(hint.get("energy_active_ratio") or 0.85)
+        active_sec = max(0.4, dur * max(0.35, min(1.0, active_ratio)))
+        units = len(re.sub(r"\s+", "", text)) if source_cjk else max(1, len(text.split()))
+        rate = units / active_sec
+        if 0.5 <= rate <= 16.0:
+            per_speaker.setdefault(seg.speaker, []).append(rate)
+            all_rates.append(rate)
+    if len(all_rates) < 3:
+        return {}
+    global_med = statistics.median(all_rates)
+    if global_med <= 0:
+        return {}
+    scales: dict[str, float] = {}
+    for spk, rates in per_speaker.items():
+        if len(rates) >= 2:
+            ratio = statistics.median(rates) / global_med
+            scales[spk] = round(max(0.80, min(1.22, ratio)), 3)
+    return scales
+
+
 class DialogueContext:
     def __init__(
         self,
@@ -133,7 +170,16 @@ class DialogueContext:
         show_bible: dict | None = None,
     ):
         self.script = script
-        self.acoustic_hints = acoustic_hints or {}
+        if acoustic_hints is not None:
+            self.acoustic_hints = acoustic_hints
+        else:
+            from backend.services.emotion_routing import extract_segment_acoustics
+
+            try:
+                self.acoustic_hints = extract_segment_acoustics(script, use_ser=False, allow_gpu_ser=False)
+            except (OSError, ValueError):
+                self.acoustic_hints = {}
+        self.speaker_pace_scale = _compute_speaker_pace_scales(script, self.acoustic_hints)
         self.show_bible = {k: v for k, v in (show_bible or {}).items() if v}
         self.ordered = sorted(script.segments, key=lambda seg: (seg.start, seg.id))
         self.positions = {seg.id: index for index, seg in enumerate(self.ordered)}
@@ -153,7 +199,17 @@ class DialogueContext:
         index = self.positions[seg.id]
         slot = seg.end - seg.start
         cjk = seg.target_lang.removeprefix("all_").split("-")[0] in {"zh", "ja", "yue", "ko"}
-        budget = max(1, int(slot * (5.0 if cjk else 2.8)))
+        hint = self.acoustic_hints.get(seg.id)
+        effective_speech_sec = slot
+        pause_sec = 0.0
+        if hint and hint.get("energy_active_ratio") is not None:
+            active_ratio = float(hint["energy_active_ratio"])
+            effective_speech_sec = min(slot, max(0.55, slot * min(1.0, active_ratio * 1.15)))
+            pause_sec = round(max(0.0, slot - effective_speech_sec), 2)
+            pace = self.speaker_pace_scale.get(seg.speaker, 1.0)
+            budget = max(1, int(effective_speech_sec * (4.6 if cjk else 2.6) * pace))
+        else:
+            budget = max(1, int(slot * (5.0 if cjk else 2.8)))
         if actual_duration is not None:
             units = len(re.sub(r"\s+", "", seg.target_text)) if cjk else len(seg.target_text.split())
             budget = min(budget, max(1, int(units * slot / actual_duration * 0.95)))
@@ -168,7 +224,6 @@ class DialogueContext:
             "before": [self._line(other) for other in self.ordered[max(0, index - 2):index]],
             "after": [self._line(other) for other in self.ordered[index + 1:index + 3]],
         }
-        hint = self.acoustic_hints.get(seg.id)
         if hint:
             acoustic_entry = {
                 key: value
@@ -178,6 +233,8 @@ class DialogueContext:
                     ("loudness_z", hint.get("rms_z")),
                     ("pitch_span_hz", hint.get("f0_range_hz")),
                     ("suggested_emotion", hint.get("suggested_emotion")),
+                    ("effective_speech_sec", round(effective_speech_sec, 2) if hint.get("energy_active_ratio") is not None else None),
+                    ("internal_pause_sec", pause_sec if pause_sec >= 0.35 else None),
                 )
                 if value is not None
             }

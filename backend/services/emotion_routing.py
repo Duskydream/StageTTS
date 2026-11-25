@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -19,7 +20,7 @@ from workers.prosody_worker import measure_clip, read_wav
 SUPPORTED_EMOTIONS: tuple[EmotionType, ...] = ("neutral", "happy", "angry", "sad", "whisper")
 _MIN_ACOUSTIC_SEC = 0.35
 _MAX_SER_SEC = 30.0
-_CACHE_FILENAME = "_acoustic_hints_v1.json"
+_CACHE_FILENAME = "_acoustic_hints_v2.json"
 
 
 def _resolve_project_vocals(script: ProjectScript) -> Path | None:
@@ -220,6 +221,41 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
+def _compute_clip_clarity(samples: list[float], rate: int, active_ratio: float | None) -> tuple[float, float]:
+    """Return (snr_proxy_db, clarity_score in [0, 1]) for choosing cleaner voice references."""
+    if not samples or rate <= 0:
+        return 0.0, 0.4
+    hop = max(1, round(rate * 0.02))
+    frame_rms = [
+        math.sqrt(sum(v * v for v in samples[i:i + hop]) / max(1, len(samples[i:i + hop])))
+        for i in range(0, len(samples), hop)
+    ]
+    if not frame_rms:
+        return 0.0, 0.4
+    sorted_db = sorted(20.0 * math.log10(max(1e-7, r)) for r in frame_rms)
+    p80 = sorted_db[int(0.80 * (len(sorted_db) - 1))]
+    p15 = sorted_db[int(0.15 * (len(sorted_db) - 1))]
+    snr_proxy_db = round(max(0.0, min(45.0, p80 - p15)), 2)
+
+    clip_rms = math.sqrt(sum(v * v for v in samples) / len(samples))
+    gate = max(10 ** (-45.0 / 20.0), clip_rms * 0.1)
+    active_vals = [r for r in frame_rms if r >= gate]
+    active_rms = math.sqrt(sum(r * r for r in active_vals) / max(1, len(active_vals))) if active_vals else clip_rms
+    tail_len = max(1, min(len(samples), round(rate * 0.10)))
+    tail = samples[-tail_len:]
+    tail_rms = math.sqrt(sum(v * v for v in tail) / len(tail))
+    tail_ratio = tail_rms / max(1e-6, active_rms)
+    peak = max(abs(v) for v in samples)
+
+    act = active_ratio if active_ratio is not None else (len(active_vals) / max(1, len(frame_rms)))
+    snr_score = max(0.0, min(1.0, (snr_proxy_db - 6.0) / 18.0))
+    act_score = 1.0 if 0.40 <= act <= 0.88 else max(0.0, 1.0 - abs(act - 0.64) * 1.8)
+    tail_score = 1.0 if tail_ratio <= 0.65 else max(0.2, 1.0 - (tail_ratio - 0.65) * 1.4)
+    peak_score = 1.0 if peak < 0.98 else 0.5
+    clarity = round(0.45 * snr_score + 0.25 * act_score + 0.15 * tail_score + 0.15 * peak_score, 3)
+    return snr_proxy_db, clarity
+
+
 def extract_segment_acoustics(
     script: ProjectScript,
     *,
@@ -278,6 +314,12 @@ def extract_segment_acoustics(
         except (OSError, ValueError, wave.Error, EOFError):
             continue
         metric_map = {item["name"]: item.get("value") for item in measurements}
+        active_ratio = (
+            round(float(metric_map["energy_active_ratio"]), 3)
+            if metric_map.get("energy_active_ratio") is not None
+            else None
+        )
+        snr_proxy_db, clarity_score = _compute_clip_clarity(samples, sample_rate, active_ratio)
         raw_metrics[seg.id] = {
             "speaker": seg.speaker,
             "rms_dbfs": round(float(metric_map["rms_dbfs"]), 2) if metric_map.get("rms_dbfs") is not None else None,
@@ -291,11 +333,9 @@ def extract_segment_acoustics(
                 if metric_map.get("f0_range_hz") is not None
                 else None
             ),
-            "energy_active_ratio": (
-                round(float(metric_map["energy_active_ratio"]), 3)
-                if metric_map.get("energy_active_ratio") is not None
-                else None
-            ),
+            "energy_active_ratio": active_ratio,
+            "snr_proxy_db": snr_proxy_db,
+            "clarity_score": clarity_score,
         }
         by_speaker.setdefault(seg.speaker, []).append(seg)
         if ser_active and 0.4 <= dur <= _MAX_SER_SEC:
@@ -333,6 +373,8 @@ def extract_segment_acoustics(
             "f0_range_hz": base["f0_range_hz"],
             "f0_range_z": f0_range_z,
             "energy_active_ratio": base["energy_active_ratio"],
+            "snr_proxy_db": base.get("snr_proxy_db"),
+            "clarity_score": base.get("clarity_score"),
             "ser_top": ser_top,
             "ser_score": ser_score,
             "scores": ser.get("scores") or {},
@@ -401,6 +443,7 @@ def select_emotion_reference_candidates(
                 abs((hints.get(seg.id) or {}).get("rms_z") or 0.0)
                 + 0.4 * abs((hints.get(seg.id) or {}).get("f0_range_z") or 0.0)
                 + _dur_penalty(seg)
+                - 0.45 * float((hints.get(seg.id) or {}).get("clarity_score") or 0.5)
                 - (0.6 if (hints.get(seg.id) or {}).get("ser_top") == "neutral" else 0.0)
                 - (0.25 if seg.emotion == "neutral" else 0.0)
             ),
@@ -450,7 +493,8 @@ def select_emotion_reference_candidates(
                 evidence_score += 0.5 * abs(rms_z if rms_z is not None else -0.7)
 
         if matched:
-            scored.append((evidence_score - 0.08 * _dur_penalty(seg), seg))
+            clarity = float(hint.get("clarity_score") or 0.5)
+            scored.append((evidence_score + 0.45 * clarity - 0.08 * _dur_penalty(seg), seg))
 
     scored.sort(key=lambda item: item[0], reverse=True)
     return [seg for _, seg in scored]

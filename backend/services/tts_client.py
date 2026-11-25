@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import io
+import re
 import tempfile
 import wave
 from collections import defaultdict
@@ -21,7 +25,13 @@ from backend.schemas import (
     ProjectScript,
     Segment,
 )
+from backend.services.emotion_routing import (
+    _non_overlapping_ids,
+    _resolve_project_vocals,
+    extract_segment_acoustics,
+)
 from backend.services.media_mixer import apply_gentle_tempo
+from backend.services.pause_alignment import assemble_island_wavs, plan_segment_pause_synthesis
 from backend.services.references import automatic_reference, reference_unavailable_reason
 from backend.services.task_runner import ensure_tts_running, gpu_task_guard
 from backend.services.text_normalization import (
@@ -29,6 +39,14 @@ from backend.services.text_normalization import (
     normalize_tts_lang,
     prepare_tts_text,
 )
+
+_EMOTION_SAMPLING: dict[str, dict[str, float | int]] = {
+    "whisper": {"top_k": 12, "top_p": 0.88, "temperature": 0.80},
+    "sad": {"top_k": 15, "top_p": 0.90, "temperature": 0.85},
+    "neutral": {"top_k": 15, "top_p": 0.92, "temperature": 0.88},
+    "happy": {"top_k": 18, "top_p": 0.95, "temperature": 0.95},
+    "angry": {"top_k": 18, "top_p": 0.95, "temperature": 0.95},
+}
 
 
 class TTSServiceUnavailableError(RuntimeError):
@@ -196,6 +214,179 @@ def measure_wav_duration(wav_path: Path) -> float:
     return round(len(audio) / 1000.0, 3)
 
 
+def _slice_aux_wav_cached(
+    vocals_path: Path,
+    project_id: str,
+    seg: Segment,
+) -> Path | None:
+    """Slice and cache a clean 32kHz mono clip for multi-reference timbre fusion."""
+    refs_dir = (config.WORKSPACE_DIR / project_id / "references").resolve()
+    ws_root = config.WORKSPACE_DIR.resolve()
+    if ws_root not in refs_dir.parents:
+        return None
+    try:
+        stat = vocals_path.stat()
+        with wave.open(str(vocals_path), "rb") as wf:
+            rate = wf.getframerate()
+            channels = wf.getnchannels()
+            width = wf.getsampwidth()
+            total_frames = wf.getnframes()
+            start_frame = max(0, round(seg.start * rate))
+            end_frame = min(total_frames, round(seg.end * rate))
+            if end_frame - start_frame < round(3.0 * rate) or end_frame - start_frame > round(10.0 * rate):
+                return None
+            key = (str(vocals_path), stat.st_mtime_ns, start_frame, end_frame)
+            name = f"aux_{hashlib.sha256(repr(key).encode()).hexdigest()[:20]}.wav"
+            out_path = refs_dir / name
+            if out_path.is_file():
+                return out_path
+            refs_dir.mkdir(parents=True, exist_ok=True)
+            wf.setpos(start_frame)
+            frames = wf.readframes(end_frame - start_frame)
+    except (OSError, wave.Error, EOFError, ValueError):
+        return None
+
+    try:
+        audio = AudioSegment(
+            data=frames,
+            sample_width=width,
+            frame_rate=rate,
+            channels=channels,
+        ).set_channels(1).set_frame_rate(32000).set_sample_width(2)
+        with tempfile.TemporaryDirectory(dir=refs_dir) as tmp_dir:
+            tmp_file = Path(tmp_dir) / name
+            with tmp_file.open("wb") as fp:
+                audio.export(fp, format="wav")
+            tmp_file.replace(out_path)
+        return out_path
+    except (OSError, ValueError):
+        return None
+
+
+def _collect_aux_ref_paths(
+    script: ProjectScript,
+    character: CharacterConfig | None,
+    speaker: str,
+    primary_ref_path: Path | None,
+    *,
+    acoustics: dict[int, dict] | None = None,
+    max_aux: int = 3,
+) -> list[Path]:
+    """Gather up to `max_aux` distinct clean speaker clips for GPT-SoVITS timbre fusion."""
+    if primary_ref_path is None or speaker == "UNKNOWN":
+        return []
+    primary_resolved = primary_ref_path.resolve()
+    chosen: list[Path] = []
+    seen: set[Path] = {primary_resolved}
+
+    if character is not None:
+        for ref in character.emotion_refs.values():
+            if not ref or not ref.wav:
+                continue
+            try:
+                candidate = config.resolve_media_path(ref.wav).resolve()
+            except ValueError:
+                continue
+            if candidate not in seen and candidate.is_file():
+                seen.add(candidate)
+                chosen.append(candidate)
+                if len(chosen) >= max_aux:
+                    return chosen
+
+    vocals_path = _resolve_project_vocals(script)
+    if vocals_path is None:
+        return chosen
+    hints = acoustics if acoustics is not None else extract_segment_acoustics(script, use_ser=False, allow_gpu_ser=False)
+    clean_ids = _non_overlapping_ids(script.segments)
+    pool = [
+        seg for seg in script.segments
+        if (
+            seg.speaker == speaker
+            and seg.id in clean_ids
+            and not seg.keep_original
+            and seg.orig_text.strip()
+            and not seg.speaker_needs_review
+            and 3.0 <= (seg.end - seg.start) <= 10.0
+        )
+    ]
+    pool.sort(
+        key=lambda seg: (
+            -(float((hints.get(seg.id) or {}).get("clarity_score") or 0.5)),
+            abs((seg.end - seg.start) - 5.5),
+            seg.id,
+        )
+    )
+    for seg in pool:
+        if len(chosen) >= max_aux:
+            break
+        sliced = _slice_aux_wav_cached(vocals_path, script.project_id, seg)
+        if sliced is not None:
+            resolved = sliced.resolve()
+            if resolved not in seen and resolved.is_file():
+                seen.add(resolved)
+                chosen.append(resolved)
+    return chosen
+
+
+def _leading_silence_seconds(wav_bytes: bytes, *, silence_thresh_db: float = -46.0) -> float:
+    try:
+        audio = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+    except Exception:
+        return 0.0
+    if len(audio) <= 100 or audio.rms == 0:
+        return 0.0
+    thresh = audio.max_possible_amplitude * (10.0 ** (silence_thresh_db / 20.0))
+    for pos in range(0, len(audio), 20):
+        if audio[pos:pos + 20].rms >= thresh:
+            return pos / 1000.0
+    return len(audio) / 1000.0
+
+
+def _wav_duration_bytes(wav_bytes: bytes) -> float:
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            rate = wf.getframerate()
+            return (wf.getnframes() / float(rate)) if rate > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _expected_max_speech_seconds(text: str, text_lang: str) -> float:
+    base_lang = normalize_tts_lang(text_lang).removeprefix("all_").split("-")[0]
+    cjk = base_lang in {"zh", "ja", "yue", "ko"}
+    cleaned = re.sub(r"[\s，。！？；…,.!?;\"'“”‘’（）()]+", "", text or "")
+    units = len(cleaned) if cjk else max(1, len(cleaned.split()))
+    return max(5.0, units * (0.48 if cjk else 0.75) + 2.5)
+
+
+def _trim_runaway_edge_silence(wav_bytes: bytes, *, silence_thresh_db: float = -46.0) -> bytes:
+    """Trim >350ms dead leading/trailing silence emitted by TTS while keeping 30ms breath cushion."""
+    try:
+        audio = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+    except Exception:
+        return wav_bytes
+    if len(audio) <= 150 or audio.rms == 0:
+        return wav_bytes
+    thresh = audio.max_possible_amplitude * (10.0 ** (silence_thresh_db / 20.0))
+    first_ms, last_ms = 0, len(audio)
+    for pos in range(0, len(audio), 20):
+        if audio[pos:pos + 20].rms >= thresh:
+            first_ms = pos
+            break
+    for pos in range(len(audio), 0, -20):
+        if audio[max(0, pos - 20):pos].rms >= thresh:
+            last_ms = pos
+            break
+    if last_ms <= first_ms:
+        return wav_bytes
+    if first_ms <= 350 and (len(audio) - last_ms) <= 350:
+        return wav_bytes
+    trimmed = audio[max(0, first_ms - 30):min(len(audio), last_ms + 30)]
+    buf = io.BytesIO()
+    trimmed.export(buf, format="wav")
+    return buf.getvalue()
+
+
 def _synthesize_single_line(
     client: httpx.Client,
     seg: Segment,
@@ -206,13 +397,17 @@ def _synthesize_single_line(
     *,
     api_url: str | None = None,
     engine: str = "gpt_sovits",
+    aux_ref_paths: list[Path] | None = None,
 ) -> None:
     text_lang = normalize_tts_lang(seg.target_lang)
     prompt_lang = normalize_tts_lang(ref.lang)
     base_url = (api_url or _tts_base_url(engine)).rstrip("/")
     label = "CosyVoice 3" if engine == "cosyvoice3" else "GPT-SoVITS"
-    payload = {
-        "text": prepare_tts_text(seg.target_text, text_lang, glossary),
+    sampling = _EMOTION_SAMPLING.get(seg.emotion, _EMOTION_SAMPLING["neutral"])
+    prepared_text = prepare_tts_text(seg.target_text, text_lang, glossary)
+    base_seed = deterministic_seed(seg.id, seg.target_text, ref.text, ref_path.name)
+    base_payload = {
+        "text": prepared_text,
         "text_lang": text_lang,
         "ref_audio_path": str(ref_path),
         "prompt_text": prepare_tts_text(ref.text, prompt_lang),
@@ -222,29 +417,53 @@ def _synthesize_single_line(
         "text_split_method": "cut0",
         "fragment_interval": 0.0,
         "batch_size": 1,
-        "seed": deterministic_seed(seg.id, seg.target_text, ref.text, ref_path.name),
         "parallel_infer": True,
         "repetition_penalty": 1.35,
+        **sampling,
     }
-    try:
-        resp = client.post(
-            f"{base_url}/tts",
-            json=payload,
-            timeout=config.TTS_TIMEOUT_SEC,
-        )
-    except httpx.HTTPError as exc:
-        raise TTSServiceUnavailableError(
-            f"无法连接 {label} 服务 ({base_url})，请确认推理服务已启动: {exc}"
-        ) from exc
+    if engine == "gpt_sovits" and aux_ref_paths:
+        primary_resolved = ref_path.resolve()
+        aux_list = [str(p) for p in aux_ref_paths if p.resolve() != primary_resolved and p.is_file()]
+        if aux_list:
+            base_payload["aux_ref_audio_paths"] = aux_list
 
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"片段 #{seg.id} TTS 推理失败 ({resp.status_code}): {resp.text[:300]}"
-        )
-    if not resp.content:
-        raise RuntimeError(f"片段 #{seg.id} TTS 返回空音频流")
+    max_reasonable = _expected_max_speech_seconds(prepared_text, text_lang)
+    best_bytes: bytes | None = None
+    best_dur: float = float("inf")
 
-    out_wav.write_bytes(resp.content)
+    for attempt in range(3):
+        payload = {**base_payload, "seed": (base_seed + attempt) % (2**31 - 1)}
+        try:
+            resp = client.post(
+                f"{base_url}/tts",
+                json=payload,
+                timeout=config.TTS_TIMEOUT_SEC,
+            )
+        except httpx.HTTPError as exc:
+            raise TTSServiceUnavailableError(
+                f"无法连接 {label} 服务 ({base_url})，请确认推理服务已启动: {exc}"
+            ) from exc
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"片段 #{seg.id} TTS 推理失败 ({resp.status_code}): {resp.text[:300]}"
+            )
+        if not resp.content:
+            raise RuntimeError(f"片段 #{seg.id} TTS 返回空音频流")
+
+        audio_bytes = resp.content
+        dur = _wav_duration_bytes(audio_bytes)
+        lead_silence = _leading_silence_seconds(audio_bytes)
+        if dur > 0 and dur < best_dur:
+            best_bytes = audio_bytes
+            best_dur = dur
+        elif best_bytes is None:
+            best_bytes = audio_bytes
+        if dur <= max_reasonable and lead_silence < 1.2:
+            break
+
+    assert best_bytes is not None
+    out_wav.write_bytes(_trim_runaway_edge_silence(best_bytes))
 
 
 def synthesize_segments_grouped(
@@ -309,6 +528,13 @@ def synthesize_segments_grouped(
 
     engine = _active_tts_engine()
     api_url = _tts_base_url(engine)
+    accepts_extended_args = "aux_ref_paths" in inspect.signature(_synthesize_single_line).parameters
+    acoustics = (
+        extract_segment_acoustics(script, use_ser=False, allow_gpu_ser=False)
+        if accepts_extended_args and _resolve_project_vocals(script) is not None
+        else {}
+    )
+    aux_cache: dict[tuple[str, Path | None], list[Path]] = {}
 
     with gpu_task_guard():
         try:
@@ -351,16 +577,86 @@ def synthesize_segments_grouped(
                     try:
                         ref_obj, ref_path = resolved_refs[(speaker, seg.emotion)]
                         raw_wav = tmp_dir / out_name
-                        _synthesize_single_line(
-                            session,
-                            seg,
-                            ref_obj,
-                            ref_path,
-                            raw_wav,
-                            script.glossary,
-                            api_url=api_url,
-                            engine=engine,
-                        )
+                        if not accepts_extended_args:
+                            _synthesize_single_line(
+                                session,
+                                seg,
+                                ref_obj,
+                                ref_path,
+                                raw_wav,
+                                script.glossary,
+                            )
+                        else:
+                            aux_key = (speaker, ref_path)
+                            if aux_key not in aux_cache:
+                                aux_cache[aux_key] = (
+                                    _collect_aux_ref_paths(
+                                        script,
+                                        character,
+                                        speaker,
+                                        ref_path,
+                                        acoustics=acoustics,
+                                    )
+                                    if engine == "gpt_sovits"
+                                    else []
+                                )
+                            aux_paths = aux_cache[aux_key]
+                            planned_clauses = (
+                                plan_segment_pause_synthesis(script, seg)
+                                if ref_path is not None
+                                else None
+                            )
+                            if planned_clauses and len(planned_clauses) >= 2:
+                                try:
+                                    clause_wavs: list[Path] = []
+                                    for c_idx, clause in enumerate(planned_clauses):
+                                        clause_wav = tmp_dir / f"seg_{seg.id:04d}_part{c_idx}.wav"
+                                        clause_seg = seg.model_copy(update={"target_text": clause.text})
+                                        _synthesize_single_line(
+                                            session,
+                                            clause_seg,
+                                            ref_obj,
+                                            ref_path,
+                                            clause_wav,
+                                            script.glossary,
+                                            api_url=api_url,
+                                            engine=engine,
+                                            aux_ref_paths=aux_paths,
+                                        )
+                                        clause_wavs.append(clause_wav)
+                                    assemble_island_wavs(
+                                        clause_wavs,
+                                        planned_clauses,
+                                        seg.end - seg.start,
+                                        raw_wav,
+                                        tmp_dir,
+                                    )
+                                except TTSServiceUnavailableError:
+                                    raise
+                                except Exception:
+                                    _synthesize_single_line(
+                                        session,
+                                        seg,
+                                        ref_obj,
+                                        ref_path,
+                                        raw_wav,
+                                        script.glossary,
+                                        api_url=api_url,
+                                        engine=engine,
+                                        aux_ref_paths=aux_paths,
+                                    )
+                            else:
+                                _synthesize_single_line(
+                                    session,
+                                    seg,
+                                    ref_obj,
+                                    ref_path,
+                                    raw_wav,
+                                    script.glossary,
+                                    api_url=api_url,
+                                    engine=engine,
+                                    aux_ref_paths=aux_paths,
+                                )
                         finished_wav = apply_gentle_tempo(raw_wav, seg.speed_factor, tmp_dir)
                         actual_duration = measure_wav_duration(finished_wav)
                         if actual_duration <= 0:

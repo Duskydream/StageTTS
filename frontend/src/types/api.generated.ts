@@ -548,6 +548,7 @@ export interface components {
             allow_unreviewed?: boolean;
             bind_to_character?: boolean;
             save_as_preset?: boolean;
+            mode?: "auto" | "standard" | "few_shot";
         };
         /** FinetuneJobStatus */
         FinetuneJobStatus: {
@@ -555,6 +556,7 @@ export interface components {
             active: boolean;
             project_id: string | null;
             speaker: string | null;
+            training_mode?: "standard" | "few_shot";
             base_model: string | null;
             gpt_epochs: number | null;
             sovits_epochs: number | null;

@@ -1,4 +1,4 @@
-import { ChevronRight, Clapperboard, FolderOpen, Upload } from "lucide-react";
+import { ChevronRight, Clapperboard, FolderOpen, Trash2, Upload } from "lucide-react";
 import type React from "react";
 import { useRef, useState } from "react";
 import { useProjectStore } from "../../store/useProjectStore";
@@ -10,11 +10,14 @@ export const WelcomeCanvas: React.FC = () => {
   const projectList = useProjectStore((s) => s.projectList);
   const backendStatus = useProjectStore((s) => s.backendStatus);
   const isLoading = useProjectStore((s) => s.isLoading);
+  const error = useProjectStore((s) => s.error);
   const importMediaFile = useProjectStore((s) => s.importMediaFile);
   const loadProjectScript = useProjectStore((s) => s.loadProjectScript);
+  const deleteProject = useProjectStore((s) => s.deleteProject);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   const handleFiles = (files: FileList | null) => {
     const file = files?.[0];
@@ -103,30 +106,74 @@ export const WelcomeCanvas: React.FC = () => {
               <div className="flex-1 overflow-y-auto">
                 <table className="w-full border-collapse text-left text-[12px]">
                   <tbody>
-                    {projectList.map((projId) => (
-                      <tr
-                        key={projId}
-                        className="border-b border-white/[0.05] transition-colors hover:bg-[#2C2C2C]"
-                      >
-                        <td className="px-3 py-1.5 font-mono tabular-nums text-primary">{projId}</td>
-                        <td className="w-16 px-3 py-1.5 text-right">
-                          <button
-                            type="button"
-                            disabled={isLoading}
-                            onClick={() => void loadProjectScript(projId)}
-                            className="h-6 rounded-[4px] border border-white/[0.08] bg-[#2C2C2C] px-2 text-[11px] text-primary transition-colors hover:bg-[#363636] disabled:opacity-50"
-                          >
-                            打开
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {projectList.map((projId) => {
+                      const confirming = confirmDeleteId === projId;
+                      return (
+                        <tr
+                          key={projId}
+                          className="border-b border-white/[0.05] transition-colors hover:bg-[#2C2C2C]"
+                        >
+                          <td className="px-3 py-1.5 font-mono tabular-nums text-primary">{projId}</td>
+                          <td className="px-3 py-1.5 text-right">
+                            {confirming ? (
+                              <div className="inline-flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  disabled={isLoading}
+                                  onClick={async () => {
+                                    const ok = await deleteProject(projId);
+                                    if (ok) setConfirmDeleteId(null);
+                                  }}
+                                  className="h-6 rounded-[4px] border border-status-error/50 bg-status-error/20 px-2 text-[11px] text-status-error transition-colors hover:bg-status-error/30 disabled:opacity-50"
+                                >
+                                  确认删除
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isLoading}
+                                  onClick={() => setConfirmDeleteId(null)}
+                                  className="h-6 rounded-[4px] border border-white/[0.08] bg-[#2C2C2C] px-2 text-[11px] text-secondary transition-colors hover:text-primary disabled:opacity-50"
+                                >
+                                  取消
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="inline-flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  disabled={isLoading}
+                                  onClick={() => void loadProjectScript(projId)}
+                                  className="h-6 rounded-[4px] border border-white/[0.08] bg-[#2C2C2C] px-2 text-[11px] text-primary transition-colors hover:bg-[#363636] disabled:opacity-50"
+                                >
+                                  打开
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isLoading || backendStatus !== "online"}
+                                  title="删除项目文件夹"
+                                  aria-label={`删除项目 ${projId}`}
+                                  onClick={() => setConfirmDeleteId(projId)}
+                                  className="flex h-6 w-6 items-center justify-center rounded-[4px] border border-white/[0.08] bg-[#2C2C2C] text-secondary transition-colors hover:border-status-error/40 hover:text-status-error disabled:opacity-40"
+                                >
+                                  <Trash2 className="h-3 w-3" strokeWidth={1.6} />
+                                </button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
             ) : (
               <div className="flex flex-1 items-center justify-center px-6 py-8 text-[11px] text-muted">
                 {backendStatus === "online" ? "暂无项目" : "未连接后端"}
+              </div>
+            )}
+            {error && (
+              <div className="border-t border-status-error/30 bg-status-error/10 px-3 py-1.5 text-[11px] text-status-error">
+                {error}
               </div>
             )}
           </div>

@@ -236,11 +236,22 @@ class EmotionAndFinetuneTest(unittest.TestCase):
         self.assertEqual(gsv_finetune._save_every_epoch(7), 1)
 
         self._populate_gsv_root(include_v2pro=True)
-        # Too few clips (< 6)
-        self._create_project("few_proj", confirmed=True, count=4)
+        # Too few clips (< 2)
+        self._create_project("few_proj", confirmed=True, count=1)
         res_few = self.client.post("/api/projects/few_proj/characters/S01/finetune", json={})
         self.assertEqual(res_few.status_code, 400)
-        self.assertIn("6 条", res_few.json()["detail"])
+        self.assertIn("2 条", res_few.json()["detail"])
+
+        # Few-shot regime (3 clips, 12s < 20s) enters few_shot mode with frozen GPT
+        few_shot_script = self._create_project("fewshot_proj", confirmed=True, count=3)
+        plan = gsv_finetune.validate_finetune_request(
+            few_shot_script,
+            "S01",
+            gsv_finetune.FinetuneStartRequest(),
+        )
+        self.assertEqual(plan.training_mode, "few_shot")
+        self.assertEqual(plan.effective_gpt_epochs, 0)
+        self.assertLessEqual(plan.effective_sovits_epochs, 8)
 
         # Unreviewed clips rejected when allow_unreviewed=False
         self._create_project("unrev_proj", confirmed=False, count=7)

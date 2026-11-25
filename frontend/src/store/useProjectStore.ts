@@ -4,6 +4,7 @@ import {
   restoreProjectSnapshot as apiRestoreProjectSnapshot,
   saveProjectScript as apiSaveProjectScript,
   synthesizeSegments as apiSynthesizeSegments,
+  deleteProject as apiDeleteProject,
   checkHealth,
   fetchProjectScript,
   fetchProjects,
@@ -73,6 +74,7 @@ interface ProjectState {
 
   initWorkspace: () => Promise<void>;
   closeProject: () => void;
+  deleteProject: (projectId: string) => Promise<boolean>;
   importMediaFile: (file: File) => Promise<void>;
   setScript: (script: ProjectScript) => void;
   setMode: (mode: ProjectMode) => void;
@@ -357,6 +359,38 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       error: null,
       lastSyncMessage: null,
     }),
+
+  deleteProject: async (projectId) => {
+    set({ isLoading: true, error: null });
+    try {
+      await apiDeleteProject(projectId);
+      set((state) => {
+        const closingActive = state.script?.project_id === projectId;
+        return {
+          projectList: state.projectList.filter((id) => id !== projectId),
+          ...(closingActive
+            ? {
+                script: null,
+                selectedSegmentId: null,
+                currentTime: 0,
+                isPlaying: false,
+                isDirty: false,
+                pastScripts: [],
+                futureScripts: [],
+                lastUndoMergeKey: null,
+              }
+            : {}),
+          isLoading: false,
+          lastSyncMessage: `已删除项目 ${projectId}`,
+        };
+      });
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "删除项目失败";
+      set({ isLoading: false, error: msg, lastSyncMessage: msg });
+      return false;
+    }
+  },
 
   importMediaFile: async (file) => {
     set({ isLoading: true, error: null });

@@ -190,6 +190,27 @@ export async function fetchProjects(): Promise<string[]> {
   return data.projects;
 }
 
+export async function deleteProject(
+  projectId: string,
+): Promise<{ status: string; project_id: string }> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
+      method: "DELETE",
+    });
+  } catch (err) {
+    throw new ApiError(err instanceof Error ? err.message : "无法连接到 StageTTS 后端服务", 0, {
+      isNetworkError: true,
+    });
+  }
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    const errObj = payload as { detail?: unknown } | undefined;
+    throw new ApiError(formatApiErrorDetail(errObj?.detail ?? payload, response.status), response.status);
+  }
+  return payload as { status: string; project_id: string };
+}
+
 export function uploadProjectMedia(
   file: File,
   mode: ProjectMode = "video_dubbing",

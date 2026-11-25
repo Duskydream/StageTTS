@@ -5,15 +5,18 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import AsyncIterator, Dict, List
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -48,6 +51,8 @@ from backend.agent.tools import (
 from backend.schemas import (
     AgentChatRequest,
     AgentChatResponse,
+    ExportDirOption,
+    ExportDirsResponse,
     GpuStatusResponse,
     HealthResponse,
     MediaInfo,
@@ -60,6 +65,7 @@ from backend.schemas import (
     ReferenceUploadResponse,
     RenderRequest,
     RenderResponse,
+    SubtitleLayout,
     SynthesizeRequest,
     SynthesizeResponse,
     TranslationRequest,
@@ -71,6 +77,7 @@ from backend.schemas import (
     VoicePresetListResponse,
 )
 from backend.services.media_mixer import check_ffmpeg_available
+from backend.services.subtitles import generate_ass_subtitles
 from backend.services.emotion_routing import build_character_emotion_refs
 from backend.services.gsv_finetune import (
     FinetuneJobStatus,
@@ -304,6 +311,21 @@ def list_projects() -> Dict[str, List[str]]:
             if item.is_dir() and (item / "script.json").is_file():
                 projects.append(item.name)
     return {"projects": projects}
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str) -> Dict[str, str]:
+    """校验无活跃任务后彻底删除 workspace/{project_id} 目录。"""
+    safe_id = _validate_project_id(project_id)
+    with project_task_guard(safe_id):
+        workspace_root = config.WORKSPACE_DIR.resolve()
+        project_dir = (workspace_root / safe_id).resolve()
+        if project_dir.parent != workspace_root:
+            raise ValueError(f"非法项目路径: {safe_id}")
+        if not project_dir.exists():
+            raise FileNotFoundError(f"未找到项目目录: {safe_id}")
+        shutil.rmtree(project_dir)
+    return {"status": "deleted", "project_id": safe_id}
 
 
 @app.get("/api/projects/{project_id}/script", response_model=ProjectScript)
@@ -701,6 +723,66 @@ def agent_chat(project_id: str, req: AgentChatRequest) -> AgentChatResponse:
     )
 
 
+@app.get("/api/projects/{project_id}/subtitles")
+def download_project_subtitles(
+    project_id: str,
+    layout: SubtitleLayout = "target",
+) -> Response:
+    """导出指定项目的 ASS 字幕文件（原文、译文或双语对照）。"""
+    safe_id = _validate_project_id(project_id)
+    script = load_project_script(safe_id)
+    ass_content = generate_ass_subtitles(script, layout=layout)
+    return Response(
+        content=ass_content.encode("utf-8-sig"),
+        media_type="text/x-ssa; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_id}_{layout}.ass"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _discover_user_export_dirs() -> List[ExportDirOption]:
+    """Discover common local export directories across Windows, macOS, and Linux."""
+    home = Path.home()
+    candidates: List[tuple[str, Path]] = []
+    if sys.platform == "darwin":
+        candidates = [("影片目录", home / "Movies"), ("下载目录", home / "Downloads")]
+    elif os.name == "nt":
+        candidates = [("视频目录", home / "Videos"), ("下载目录", home / "Downloads"), ("桌面", home / "Desktop")]
+    else:
+        xdg = shutil.which("xdg-user-dir")
+        mapping = {"VIDEOS": "视频目录", "DOWNLOAD": "下载目录", "DESKTOP": "桌面"}
+        if xdg:
+            for key, label in mapping.items():
+                try:
+                    proc = subprocess.run([xdg, key], capture_output=True, text=True, timeout=3)
+                    raw = (proc.stdout or "").strip()
+                    if proc.returncode == 0 and raw:
+                        candidates.append((label, Path(raw)))
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        else:
+            candidates = [("视频目录", home / "Videos"), ("下载目录", home / "Downloads")]
+    seen: set[Path] = {home.resolve()}
+    result: List[ExportDirOption] = []
+    for label, path in candidates:
+        resolved = path.expanduser().resolve()
+        if resolved not in seen and resolved.is_dir():
+            seen.add(resolved)
+            result.append(ExportDirOption(label=label, path=str(resolved)))
+    return result
+
+
+@app.get("/api/export/dirs", response_model=ExportDirsResponse)
+def get_export_dirs() -> ExportDirsResponse:
+    """返回项目工作区及本机常用推荐导出目录。"""
+    return ExportDirsResponse(
+        workspace_dir=str(config.WORKSPACE_DIR.resolve()),
+        suggested_dirs=_discover_user_export_dirs(),
+    )
+
+
 @app.post("/api/projects/{project_id}/render", response_model=RenderResponse)
 def render_project_video(project_id: str, req: RenderRequest) -> RenderResponse:
     """执行 pydub 毫秒拼轨与 FFmpeg 混音封装，导出 output.mp4（或虚拟舞台音频）。"""
@@ -711,6 +793,10 @@ def render_project_video(project_id: str, req: RenderRequest) -> RenderResponse:
             safe_id,
             burn_watermark=req.burn_watermark,
             burn_subtitles=req.burn_subtitles,
+            export_ass_sidecar=req.export_ass_sidecar,
+            auto_ducking=req.auto_ducking,
             auto_fit_overflow=req.auto_fit_overflow,
+            output_filename=req.output_filename,
+            output_dir=req.output_dir,
         ),
     )

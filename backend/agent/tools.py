@@ -13,8 +13,8 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from weakref import WeakValueDictionary
 
 from backend import config
-from backend.schemas import ProjectScript, Segment, SegmentPatch, SynthesizeResponse
-from backend.services.media_mixer import mix_and_render
+from backend.schemas import ProjectScript, Segment, SegmentPatch, StemVolumes, SubtitleBurnMode, SubtitleLayout, SynthesizeResponse
+from backend.services.media_mixer import export_project_deliverables
 from backend.services.synthesis import synthesize_with_duration_check
 from backend.services.task_runner import GpuBusyError, gpu_task_guard
 from backend.services.tts_client import TTSServiceUnavailableError
@@ -185,40 +185,63 @@ def synthesize_segments(
 
 def update_mix_settings(
     project_id: str,
-    bgm_volume: float,
+    bgm_volume: Optional[float] = None,
+    singing_volume: Optional[float] = None,
+    music_volume: Optional[float] = None,
+    effects_volume: Optional[float] = None,
+    auto_ducking: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """更新背景伴奏音量系数（限 0.0 ~ 2.0）并持久化 script.json。"""
-    clamped = max(0.0, min(2.0, float(bgm_volume)))
+    """更新背景混音主音量、四轨子音量与自动闪避开关（0.0 ~ 2.0）并持久化 script.json。"""
+    def _clamp(val: float) -> float:
+        return round(max(0.0, min(2.0, float(val))), 3)
+
     with project_task_guard(project_id):
         script = load_project_script(project_id)
-        script.media.bgm_volume = clamped
+        if bgm_volume is not None:
+            script.media.bgm_volume = _clamp(bgm_volume)
+        if any(v is not None for v in (singing_volume, music_volume, effects_volume)):
+            current = script.media.stem_volumes or StemVolumes()
+            script.media.stem_volumes = StemVolumes(
+                singing=_clamp(singing_volume) if singing_volume is not None else current.singing,
+                music=_clamp(music_volume) if music_volume is not None else current.music,
+                effects=_clamp(effects_volume) if effects_volume is not None else current.effects,
+            )
+        if auto_ducking is not None:
+            script.media.auto_ducking = bool(auto_ducking)
         save_project_script(script)
-    return {"bgm_volume": clamped}
+    return {
+        "bgm_volume": script.media.bgm_volume,
+        "stem_volumes": script.media.stem_volumes.model_dump() if script.media.stem_volumes else None,
+        "auto_ducking": script.media.auto_ducking,
+    }
 
 
 def render_final_video(
     project_id: str,
     burn_watermark: bool = False,
-    burn_subtitles: str = "none",
+    burn_subtitles: SubtitleBurnMode = "none",
+    export_ass_sidecar: Optional[SubtitleLayout] = None,
+    auto_ducking: Optional[bool] = None,
     auto_fit_overflow: bool = False,
+    output_filename: Optional[str] = None,
+    output_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """触发 pydub 拼轨与 FFmpeg 混音封装，输出成片路径并回写 script.json。"""
     with project_task_guard(project_id):
         script = load_project_script(project_id)
-        output_video, duration = mix_and_render(
+        result = export_project_deliverables(
             script,
             burn_watermark=burn_watermark,
-            burn_subtitles=burn_subtitles,  # type: ignore[arg-type]
+            burn_subtitles=burn_subtitles,
+            export_ass_sidecar=export_ass_sidecar,
+            auto_ducking=auto_ducking,
             auto_fit_overflow=auto_fit_overflow,
+            output_filename=output_filename,
+            output_dir=output_dir,
         )
-        script.media.output_video = output_video
+        script.media.output_video = result["output_video"]
         save_project_script(script)
-    return {
-        "output_video": output_video,
-        "duration": duration,
-        "burn_watermark": burn_watermark,
-        "burn_subtitles": burn_subtitles,
-    }
+    return result
 
 
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
